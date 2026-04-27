@@ -8,7 +8,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
-COPY NunitoVariable.ttf .
 COPY Nunito-SemiBold.ttf .
+
+# Проверяем что шрифт скопирован
+RUN ls -la Nunito-SemiBold.ttf && echo "Шрифт OK"
 
 CMD ["python", "bot.py"]
