@@ -150,9 +150,27 @@ def process_image(img: Image.Image, format_key: str, hashtag: str) -> Image.Imag
 
         try:
             font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Nunito-SemiBold.ttf")
+            if not os.path.exists(font_path):
+                raise FileNotFoundError(f"Шрифт не найден: {font_path}")
             font = ImageFont.truetype(font_path, hashtag_size)
-        except Exception:
-            font = ImageFont.load_default()
+            logger.info(f"Шрифт загружен: {font_path}, размер {hashtag_size}px")
+        except Exception as e:
+            logger.error(f"Ошибка шрифта: {e}. Ищем системный...")
+            # Ищем любой системный ttf шрифт
+            system_fonts = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            ]
+            font = None
+            for sf in system_fonts:
+                if os.path.exists(sf):
+                    font = ImageFont.truetype(sf, hashtag_size)
+                    logger.info(f"Используем системный шрифт: {sf}")
+                    break
+            if font is None:
+                logger.error("Системный шрифт не найден, используем load_default")
+                font = ImageFont.load_default(size=hashtag_size)
 
         fill = (hcr, hcg, hcb, int(255 * ALPHA))
         spacing = int(hashtag_size * (-0.007))
