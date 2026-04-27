@@ -8,12 +8,13 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
+COPY Nunito-SemiBold.ttf .
+RUN ls -la /app/Nunito-SemiBold.ttf && echo "Шрифт скачан OK" || echo "ERROR: Шрифт не скачался"
 # Скачиваем шрифт напрямую при сборке образа
-RUN curl -L "https://github.com/google/fonts/raw/main/ofl/nunito/static/Nunito-SemiBold.ttf" \
-    -o /app/Nunito-SemiBold.ttf && \
-    ls -la /app/Nunito-SemiBold.ttf && \
-    echo "Шрифт скачан OK"
+#RUN curl -L "https://github.com/google/fonts/raw/main/ofl/nunito/static/Nunito-SemiBold.ttf" \
+#    -o /app/Nunito-SemiBold.ttf && \
+#    ls -la /app/Nunito-SemiBold.ttf && \
+#    echo "Шрифт скачан OK"
 
 COPY bot.py .
 
