@@ -8,8 +8,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY Nunito-VariableFont_wght.ttf .
-RUN ls -la /app/Nunito-VariableFont_wght.ttf && echo "Шрифт скачан OK" || echo "ERROR: Шрифт не скачался"
+COPY Nunito-SemiBold.ttf .
 # Скачиваем шрифт напрямую при сборке образа
 #RUN curl -L "https://github.com/google/fonts/raw/main/ofl/nunito/static/Nunito-SemiBold.ttf" \
 #    -o /app/Nunito-SemiBold.ttf && \
