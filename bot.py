@@ -149,7 +149,7 @@ def process_image(img: Image.Image, format_key: str, hashtag: str) -> Image.Imag
         draw = ImageDraw.Draw(overlay)
 
         try:
-            font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Nunito-VariableFont_wght.ttf")
+            font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Nunito-SemiBold.ttf")
             if not os.path.exists(font_path):
                 raise FileNotFoundError(f"Шрифт не найден: {font_path}")
             font = ImageFont.truetype(font_path, hashtag_size)
