@@ -54,7 +54,7 @@ def draw_logo(canvas: Image.Image, x: int, y: int, w: int, h: int, color: tuple)
     sx = w / 365
     sy = h / 459
     # Внешнее кольцо
-    outer = [int(0*sx), int(94*sy), int(365*sx), int(459*sy)]
+    outer = [0, int(94*sy), w - 1, h - 1]
     inner = [int(84*sx), int(179*sy), int(280*sx), int(375*sy)]
     d.ellipse(outer, fill=fill)
     d.ellipse(inner, fill=(0, 0, 0, 0))
@@ -320,4 +320,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
