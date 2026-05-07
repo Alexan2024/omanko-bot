@@ -41,7 +41,7 @@ HASHTAG_RIGHT = 80
 HASHTAG_BOTTOM = 79
 HASHTAG_SIZE = 51
 BRIGHTNESS_OFFSET = 45
-ALPHA = 0.75
+ALPHA = 0.95
 
 
 def draw_logo(canvas: Image.Image, x: int, y: int, w: int, h: int, color: tuple):
