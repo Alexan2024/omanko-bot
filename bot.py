@@ -30,7 +30,7 @@ HASHTAGS = [
     "— Без хештега —",
     "#architecture", "#cars", "#cinema", "#archives",
     "#art", "#community", "#item", "#music",
-    "#paper", "#space", "#style",
+    "#paper", "#space", "#style", "#beauty", "#fashion"
 ]
 
 LOGO_W = 56
