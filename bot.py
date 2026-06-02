@@ -51,9 +51,8 @@ ALPHA = 0.95
 
 # ============ Обложка — параметры ============
 # Заголовок (Nunito Sans Black)
-COVER_TITLE_SIZE_FEED = 135      # на ширину 1920
+COVER_TITLE_SIZE_FEED = 135      # абсолютный размер на всех соотношениях ленты
 COVER_TITLE_LS_FEED = -0.03      # letter-spacing -3%
-COVER_TITLE_BOTTOM_FEED = 436    # 390 + 46 (поднят выше)
 COVER_TITLE_SIZE_STORY = 77      # на канвас 1080x1920
 COVER_TITLE_LS_STORY = -0.06     # letter-spacing -6%
 COVER_TITLE_BOTTOM_IG = 452      # 424 + 28 (поднят выше)
@@ -69,10 +68,7 @@ WORDMARK_TOP_STORY = 168
 # Бабл с хештегом
 BUBBLE_TEXT_SIZE = HASHTAG_SIZE  # 51 — как в обычных постах
 # Лента: бабл сверху по центру
-FEED_BUBBLE_H = 126
-FEED_BUBBLE_RADIUS = 60
-FEED_BUBBLE_TOP = 68
-FEED_BUBBLE_PAD_X = 48           # горизонтальный паддинг текста в бабле
+FEED_BUBBLE_PAD_X = 48           # горизонтальный паддинг текста в бабле (лента)
 # Сторис IG: бабл под заголовком
 IG_BUBBLE_BOTTOM = 215
 IG_BUBBLE_W = 387
@@ -94,10 +90,20 @@ STORY_BUBBLE_ALPHA = 0.50
 # Градиент под заголовком: чёрный снизу вверх, адаптивный
 GRAD_ALPHA_DARK = 0.18           # фон тёмный → слабый градиент
 GRAD_ALPHA_LIGHT = 0.62          # фон светлый → плотный
-GRAD_RISE_FEED = 1100            # высота градиента над низом (на 1920w)
 GRAD_RISE_STORY = 900            # высота градиента над низом (на 1080w)
 
 STORY_SIZE = (1080, 1920)
+
+# Пер-ратио геометрия обложек (ленты). Размеры абсолютные на своём канвасе.
+# bubble_top — отступ бабла от верха; title_bottom — отступ заголовка от низа.
+COVER_FORMATS = {
+    "4:5": dict(size=(1920, 2400), bubble_h=126, bubble_top=68, title_bottom=365),
+    "2:3": dict(size=(1920, 2560), bubble_h=126, bubble_top=68, title_bottom=365),
+    "1:1": dict(size=(2400, 2400), bubble_h=158, bubble_top=85, title_bottom=365),
+    "3:2": dict(size=(3600, 2400), bubble_h=126, bubble_top=68, title_bottom=390),
+}
+# Адаптивный режим обложки использует параметры 4:5
+COVER_DEFAULT = dict(bubble_h=126, bubble_top=68, title_bottom=365)
 
 _WORDMARK = None
 
@@ -361,44 +367,52 @@ def draw_bubble(canvas_rgba: Image.Image, center_x: int, center_y: int,
 
 # ============ Обложка: рендер вариантов ============
 def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: str) -> Image.Image:
-    fmt = FORMATS[format_key]
-    if fmt is None:
+    spec = COVER_FORMATS.get(format_key)
+    if spec is None:
+        # Адаптивный: канвас по картинке (мин. ширина 1920), параметры — дефолтные
         if img.width < 1920:
-            scale = 1920 / img.width
-            canvas_w, canvas_h = 1920, int(img.height * scale)
+            sc = 1920 / img.width
+            canvas_w, canvas_h = 1920, int(img.height * sc)
         else:
             canvas_w, canvas_h = img.size
+        bubble_h = COVER_DEFAULT["bubble_h"]
+        bubble_top = COVER_DEFAULT["bubble_top"]
+        title_bottom = COVER_DEFAULT["title_bottom"]
     else:
-        canvas_w, canvas_h = fmt
-    scale = canvas_w / 1920
+        canvas_w, canvas_h = spec["size"]
+        bubble_h = spec["bubble_h"]
+        bubble_top = spec["bubble_top"]
+        title_bottom = spec["title_bottom"]
+
+    # Размеры элементов абсолютные (не масштабируются от ширины)
+    title_size = COVER_TITLE_SIZE_FEED
+    wm_w = WORDMARK_W_FEED
+    wm_bottom = WORDMARK_BOTTOM_FEED
+    radius = bubble_h // 2  # полная «таблетка»
 
     base = fit_image_to_canvas(img, canvas_w, canvas_h)
 
     # градиент — по яркости в зоне заголовка
-    title_size = int(COVER_TITLE_SIZE_FEED * scale)
-    region_y = canvas_h - int(COVER_TITLE_BOTTOM_FEED * scale) - title_size * 2
-    br_r, br_g, br_b = get_average_color(base, 0, max(0, region_y), canvas_w, title_size * 2)
-    canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), int(GRAD_RISE_FEED * scale))
+    region_y = max(0, canvas_h - title_bottom - title_size * 2)
+    br_r, br_g, br_b = get_average_color(base, 0, region_y, canvas_w, title_size * 2)
+    grad_rise = min(canvas_h, title_bottom + title_size * 4)
+    canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), grad_rise)
 
     # заголовок
-    draw_centered_title(canvas, title, title_size, COVER_TITLE_LS_FEED,
-                        int(COVER_TITLE_BOTTOM_FEED * scale))
+    draw_centered_title(canvas, title, title_size, COVER_TITLE_LS_FEED, title_bottom)
 
     # бабл сверху по центру — тёмный плотный, с хештегом
     if hashtag and hashtag != "— Без хештега —":
-        bubble_h = int(FEED_BUBBLE_H * scale)
-        radius = int(FEED_BUBBLE_RADIUS * scale)
-        cy = int(FEED_BUBBLE_TOP * scale) + bubble_h // 2
+        cy = bubble_top + bubble_h // 2
         bg_for_bubble = canvas.convert("RGB")
         label = "# " + hashtag.lstrip("#")
         draw_bubble(canvas, canvas_w // 2, cy, None, bubble_h, radius, bg_for_bubble,
                     label=label, color_mode="dark", alpha=FEED_BUBBLE_ALPHA)
 
     # вордмарк снизу по центру (белый)
-    wm_w = int(WORDMARK_W_FEED * scale)
     ratio = get_wordmark().height / get_wordmark().width
     wm_h = round(wm_w * ratio)
-    wm_y = canvas_h - int(WORDMARK_BOTTOM_FEED * scale) - wm_h
+    wm_y = canvas_h - wm_bottom - wm_h
     paste_wordmark(canvas, wm_w, canvas_w // 2, wm_y)
 
     return canvas.convert("RGB")
