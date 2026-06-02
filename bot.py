@@ -14,15 +14,20 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
+# ============ Состояния диалога ============
+CHOOSING_TYPE = 0
 WAITING_PHOTOS = 1
 CHOOSING_FORMAT = 2
 CHOOSING_HASHTAG = 3
+WAITING_TITLE = 4
+
+BASE = os.path.dirname(os.path.abspath(__file__))
 
 FORMATS = {
-    "4:5":        (1920, 2400),
-    "2:3":        (1920, 2880),
-    "1:1":        (1920, 1920),
-    "3:2":        (1920, 1280),
+    "4:5": (1920, 2400),
+    "2:3": (1920, 2880),
+    "1:1": (1920, 1920),
+    "3:2": (1920, 1280),
     "Адаптивный": None,
 }
 
@@ -33,6 +38,7 @@ HASHTAGS = [
     "#paper", "#space", "#style", "#beauty", "#fashion"
 ]
 
+# ============ Тип 1 (брендинг) — БЕЗ ИЗМЕНЕНИЙ ============
 LOGO_W = 56
 LOGO_H = 71
 LOGO_LEFT = 92
@@ -43,34 +49,71 @@ HASHTAG_SIZE = 51
 BRIGHTNESS_OFFSET = 45
 ALPHA = 0.95
 
+# ============ Обложка — параметры ============
+# Заголовок (Nunito Sans Black)
+COVER_TITLE_SIZE_FEED = 135      # на ширину 1920
+COVER_TITLE_LS_FEED = -0.03      # letter-spacing -3%
+COVER_TITLE_BOTTOM_FEED = 390
+COVER_TITLE_SIZE_STORY = 77      # на канвас 1080x1920
+COVER_TITLE_LS_STORY = -0.06     # letter-spacing -6%
+COVER_TITLE_BOTTOM_IG = 424
+COVER_TITLE_BOTTOM_TG = 354
+COVER_LINE_SPACING = 1.08        # межстрочный множитель
 
-def draw_logo(canvas: Image.Image, x: int, y: int, w: int, h: int, color: tuple):
-    """Рисует логотип Ö через Pillow — без cairosvg."""
-    logo = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(logo)
-    r, g, b = color
-    a = int(255 * ALPHA)
-    fill = (r, g, b, a)
-    sx = w / 365
-    sy = h / 459
-    # Внешнее кольцо
-    outer = [0, int(94*sy), w - 1, h - 1]
-    inner = [int(84*sx), int(179*sy), int(280*sx), int(375*sy)]
-    d.ellipse(outer, fill=fill)
-    d.ellipse(inner, fill=(0, 0, 0, 0))
-    # Левая точка умлаута
-    d.ellipse([int(79*sx), int(0*sy), int(164*sx), int(85*sy)], fill=fill)
-    # Правая точка умлаута
-    d.ellipse([int(201*sx), int(0*sy), int(286*sx), int(85*sy)], fill=fill)
-    canvas.paste(logo, (x, y), logo)
+# Вордмарк ÖMANKÖ (всегда белый)
+WORDMARK_W_FEED = 326            # низ ленты, отступ снизу 65
+WORDMARK_BOTTOM_FEED = 65
+WORDMARK_W_STORY = 195           # верх сторис, отступ сверху 168
+WORDMARK_TOP_STORY = 168
+
+# Бабл с хештегом
+BUBBLE_TEXT_SIZE = HASHTAG_SIZE  # 51 — как в обычных постах
+# Лента: бабл сверху по центру
+FEED_BUBBLE_H = 126
+FEED_BUBBLE_RADIUS = 60
+FEED_BUBBLE_TOP = 68
+FEED_BUBBLE_PAD_X = 48           # горизонтальный паддинг текста в бабле
+# Сторис IG: бабл под заголовком
+IG_BUBBLE_BOTTOM = 215
+IG_BUBBLE_W = 387
+IG_BUBBLE_H = 135
+IG_BUBBLE_RADIUS = 41
+# Сторис TG: бабл под заголовком
+TG_BUBBLE_BOTTOM = 161
+TG_BUBBLE_W = 430
+TG_BUBBLE_H = 115
+TG_BUBBLE_RADIUS = 17
+
+# Бабл: чёрный, полупрозрачный, адаптивный по фону
+BUBBLE_ALPHA_DARK = 0.30         # фон тёмный → слабее
+BUBBLE_ALPHA_LIGHT = 0.45        # фон светлый → плотнее
+BUBBLE_FILL = (0, 0, 0)
+
+# Градиент под заголовком: чёрный снизу вверх, адаптивный
+GRAD_ALPHA_DARK = 0.18           # фон тёмный → слабый градиент
+GRAD_ALPHA_LIGHT = 0.62          # фон светлый → плотный
+GRAD_RISE_FEED = 1100            # высота градиента над низом (на 1920w)
+GRAD_RISE_STORY = 900            # высота градиента над низом (на 1080w)
+
+STORY_SIZE = (1080, 1920)
+
+_WORDMARK = None
 
 
+# ============ Общие утилиты ============
 def get_average_color(img: Image.Image, x: int, y: int, w: int, h: int):
+    x = max(0, x); y = max(0, y)
     x2 = min(x + w, img.width)
     y2 = min(y + h, img.height)
+    if x2 <= x or y2 <= y:
+        return 0.0, 0.0, 0.0
     region = img.crop((x, y, x2, y2)).convert("RGB")
     arr = np.array(region).reshape(-1, 3).mean(axis=0)
     return float(arr[0]), float(arr[1]), float(arr[2])
+
+
+def brightness_of(r, g, b):
+    return (r * 299 + g * 587 + b * 114) / 1000
 
 
 def adjust_brightness(r, g, b, percent):
@@ -86,33 +129,11 @@ def adjust_brightness(r, g, b, percent):
     return int(r), int(g), int(b)
 
 
-def process_image(img: Image.Image, format_key: str, hashtag: str) -> Image.Image:
-    fmt = FORMATS[format_key]
-    if fmt is None:
-        # Адаптивный: сохраняем пропорции, но минимальная ширина 1920px
-        if img.width < 1920:
-            scale = 1920 / img.width
-            canvas_w = 1920
-            canvas_h = int(img.height * scale)
-        else:
-            canvas_w, canvas_h = img.size
-    else:
-        canvas_w, canvas_h = fmt
-
-    # Все размеры элементов масштабируем от ширины канваса
-    scale = canvas_w / 1920
-    logo_w = int(LOGO_W * scale)
-    logo_h = int(LOGO_H * scale)
-    logo_x = int(LOGO_LEFT * scale)
-    logo_y = canvas_h - int(LOGO_BOTTOM * scale) - logo_h
-    hashtag_right = int(HASHTAG_RIGHT * scale)
-    hashtag_bottom = int(HASHTAG_BOTTOM * scale)
-    hashtag_size = int(HASHTAG_SIZE * scale)
-
+def fit_image_to_canvas(img: Image.Image, canvas_w: int, canvas_h: int) -> Image.Image:
+    """Заполнение канваса с центрированием и обрезкой (cover)."""
     canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
     img_ratio = img.width / img.height
     canvas_ratio = canvas_w / canvas_h
-
     if img_ratio > canvas_ratio:
         draw_h = canvas_h
         draw_w = int(draw_h * img_ratio)
@@ -123,14 +144,87 @@ def process_image(img: Image.Image, format_key: str, hashtag: str) -> Image.Imag
         draw_h = int(draw_w / img_ratio)
         offset_x = 0
         offset_y = (canvas_h - draw_h) // 2
-
     resized = img.resize((draw_w, draw_h), Image.LANCZOS)
     canvas.paste(resized, (offset_x, offset_y))
+    return canvas
+
+
+def load_semibold(size: int) -> ImageFont.FreeTypeFont:
+    path = os.path.join(BASE, "Nunito-SemiBold.ttf")
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception as e:
+        logger.error(f"SemiBold не найден ({e}), системный fallback")
+        for sf in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",):
+            if os.path.exists(sf):
+                return ImageFont.truetype(sf, size)
+        return ImageFont.load_default(size=size)
+
+
+def load_black(size: int) -> ImageFont.FreeTypeFont:
+    path = os.path.join(BASE, "NunitoSans-Black.ttf")
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception as e:
+        logger.error(f"Black не найден ({e}), системный fallback")
+        for sf in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",):
+            if os.path.exists(sf):
+                return ImageFont.truetype(sf, size)
+        return ImageFont.load_default(size=size)
+
+
+def get_wordmark() -> Image.Image:
+    global _WORDMARK
+    if _WORDMARK is None:
+        _WORDMARK = Image.open(os.path.join(BASE, "wordmark_white.png")).convert("RGBA")
+    return _WORDMARK
+
+
+# ============ Тип 1: логотип Ö (без изменений) ============
+def draw_logo(canvas: Image.Image, x: int, y: int, w: int, h: int, color: tuple):
+    logo = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(logo)
+    r, g, b = color
+    a = int(255 * ALPHA)
+    fill = (r, g, b, a)
+    sx = w / 365
+    sy = h / 459
+    outer = [0, int(94 * sy), w - 1, h - 1]
+    inner = [int(84 * sx), int(179 * sy), int(280 * sx), int(375 * sy)]
+    d.ellipse(outer, fill=fill)
+    d.ellipse(inner, fill=(0, 0, 0, 0))
+    d.ellipse([int(79 * sx), int(0 * sy), int(164 * sx), int(85 * sy)], fill=fill)
+    d.ellipse([int(201 * sx), int(0 * sy), int(286 * sx), int(85 * sy)], fill=fill)
+    canvas.paste(logo, (x, y), logo)
+
+
+def process_image(img: Image.Image, format_key: str, hashtag: str) -> Image.Image:
+    """ТИП 1 — брендинг (логика без изменений)."""
+    fmt = FORMATS[format_key]
+    if fmt is None:
+        if img.width < 1920:
+            scale = 1920 / img.width
+            canvas_w = 1920
+            canvas_h = int(img.height * scale)
+        else:
+            canvas_w, canvas_h = img.size
+    else:
+        canvas_w, canvas_h = fmt
+
+    scale = canvas_w / 1920
+    logo_w = int(LOGO_W * scale)
+    logo_h = int(LOGO_H * scale)
+    logo_x = int(LOGO_LEFT * scale)
+    logo_y = canvas_h - int(LOGO_BOTTOM * scale) - logo_h
+    hashtag_right = int(HASHTAG_RIGHT * scale)
+    hashtag_bottom = int(HASHTAG_BOTTOM * scale)
+    hashtag_size = int(HASHTAG_SIZE * scale)
+
+    canvas = fit_image_to_canvas(img, canvas_w, canvas_h)
 
     # ЛОГОТИП
     r, g, b = get_average_color(canvas, logo_x, logo_y, logo_w, logo_h)
-    brightness = (r * 299 + g * 587 + b * 114) / 1000
-    percent = BRIGHTNESS_OFFSET if brightness < 128 else -BRIGHTNESS_OFFSET
+    percent = BRIGHTNESS_OFFSET if brightness_of(r, g, b) < 128 else -BRIGHTNESS_OFFSET
     logo_color = adjust_brightness(r, g, b, percent)
     canvas_rgba = canvas.convert("RGBA")
     draw_logo(canvas_rgba, logo_x, logo_y, logo_w, logo_h, logo_color)
@@ -141,60 +235,203 @@ def process_image(img: Image.Image, format_key: str, hashtag: str) -> Image.Imag
         sample_x = max(0, canvas_w - hashtag_right - int(200 * scale))
         sample_y = max(0, canvas_h - hashtag_bottom - hashtag_size)
         hr, hg, hb = get_average_color(canvas, sample_x, sample_y, int(200 * scale), hashtag_size + 20)
-        h_brightness = (hr * 299 + hg * 587 + hb * 114) / 1000
-        h_percent = BRIGHTNESS_OFFSET if h_brightness < 128 else -BRIGHTNESS_OFFSET
+        h_percent = BRIGHTNESS_OFFSET if brightness_of(hr, hg, hb) < 128 else -BRIGHTNESS_OFFSET
         hcr, hcg, hcb = adjust_brightness(hr, hg, hb, h_percent)
 
         overlay = canvas.convert("RGBA")
         draw = ImageDraw.Draw(overlay)
-
-        try:
-            font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Nunito-SemiBold.ttf")
-            if not os.path.exists(font_path):
-                raise FileNotFoundError(f"Шрифт не найден: {font_path}")
-            font = ImageFont.truetype(font_path, hashtag_size)
-            logger.info(f"Шрифт загружен: {font_path}, размер {hashtag_size}px")
-        except Exception as e:
-            logger.error(f"Ошибка шрифта: {e}. Ищем системный...")
-            # Ищем любой системный ttf шрифт
-            system_fonts = [
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-                "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-            ]
-            font = None
-            for sf in system_fonts:
-                if os.path.exists(sf):
-                    font = ImageFont.truetype(sf, hashtag_size)
-                    logger.info(f"Используем системный шрифт: {sf}")
-                    break
-            if font is None:
-                logger.error("Системный шрифт не найден, используем load_default")
-                font = ImageFont.load_default(size=hashtag_size)
-
+        font = load_semibold(hashtag_size)
         fill = (hcr, hcg, hcb, int(255 * ALPHA))
         spacing = int(hashtag_size * (-0.007))
-
         total_w = 0
         char_widths = []
         for ch in hashtag:
             bbox = draw.textbbox((0, 0), ch, font=font)
-            w = bbox[2] - bbox[0]
-            char_widths.append(w)
-            total_w += w + spacing
+            cw = bbox[2] - bbox[0]
+            char_widths.append(cw)
+            total_w += cw + spacing
         total_w -= spacing
-
         tx = canvas_w - hashtag_right - total_w
         ty = canvas_h - hashtag_bottom - hashtag_size
-
         cx = tx
         for ch, cw in zip(hashtag, char_widths):
             draw.text((cx, ty), ch, font=font, fill=fill)
             cx += cw + spacing
-
         canvas = overlay.convert("RGB")
 
     return canvas
+
+
+# ============ Обложка: примитивы ============
+def paste_wordmark(canvas_rgba: Image.Image, target_w: int, cx: int, y_top: int):
+    wm = get_wordmark()
+    ratio = wm.height / wm.width
+    target_h = max(1, round(target_w * ratio))
+    resized = wm.resize((target_w, target_h), Image.LANCZOS)
+    x = int(cx - target_w / 2)
+    canvas_rgba.alpha_composite(resized, (x, y_top))
+    return target_h
+
+
+def apply_bottom_gradient(canvas: Image.Image, brightness: float, rise: int) -> Image.Image:
+    """Чёрный градиент снизу вверх. Плотность зависит от яркости фона."""
+    cw, ch = canvas.size
+    t = max(0.0, min(1.0, brightness / 255.0))
+    max_alpha = int(255 * (GRAD_ALPHA_DARK + (GRAD_ALPHA_LIGHT - GRAD_ALPHA_DARK) * t))
+    rise = min(rise, ch)
+    # вертикальный градиент: 0 сверху rise-зоны -> max_alpha у низа
+    ramp = np.linspace(0, max_alpha, rise).astype(np.uint8).reshape(-1, 1)
+    ramp = np.repeat(ramp, cw, axis=1)
+    mask_full = np.zeros((ch, cw), dtype=np.uint8)
+    mask_full[ch - rise:ch, :] = ramp
+    mask = Image.fromarray(mask_full, mode="L")
+    black = Image.new("RGBA", (cw, ch), (0, 0, 0, 255))
+    base = canvas.convert("RGBA")
+    base = Image.composite(black, base, mask)
+    return base
+
+
+def draw_centered_title(canvas_rgba: Image.Image, text: str, size: int,
+                        ls_ratio: float, bottom_offset: int):
+    cw, ch = canvas_rgba.size
+    font = load_black(size)
+    draw = ImageDraw.Draw(canvas_rgba)
+    ls_px = round(size * ls_ratio)
+    lines = [ln for ln in text.split("\n")]
+    if not lines:
+        return
+    ascent, descent = font.getmetrics()
+    line_adv = int(size * COVER_LINE_SPACING)
+    line_visual = ascent + descent
+    n = len(lines)
+    last_top = (ch - bottom_offset) - line_visual
+    first_top = last_top - (n - 1) * line_adv
+    cx = cw / 2
+    fill = (255, 255, 255, 255)
+    for i, line in enumerate(lines):
+        # ширина строки с трекингом
+        widths = [draw.textlength(c, font=font) for c in line]
+        total = sum(widths) + ls_px * (len(line) - 1 if len(line) > 1 else 0)
+        x = cx - total / 2
+        y = first_top + i * line_adv
+        for c, w in zip(line, widths):
+            draw.text((x, y), c, font=font, fill=fill)
+            x += w + ls_px
+
+
+def draw_bubble(canvas_rgba: Image.Image, hashtag: str, center_x: int, center_y: int,
+                bubble_w, bubble_h: int, radius: int, bg_img: Image.Image):
+    """Бабл с хештегом. bubble_w=None -> авто-ширина под текст (лента)."""
+    if not hashtag or hashtag == "— Без хештега —":
+        return
+    label = "# " + hashtag.lstrip("#")
+    font = load_semibold(BUBBLE_TEXT_SIZE)
+    draw = ImageDraw.Draw(canvas_rgba)
+    tw = draw.textlength(label, font=font)
+    if bubble_w is None:
+        bubble_w = int(tw + 2 * FEED_BUBBLE_PAD_X)
+    left = int(center_x - bubble_w / 2)
+    top = int(center_y - bubble_h / 2)
+    right = left + bubble_w
+    bottom = top + bubble_h
+
+    # адаптивная плотность бабла по фону под ним
+    r, g, b = get_average_color(bg_img, left, top, bubble_w, bubble_h)
+    a = BUBBLE_ALPHA_LIGHT if brightness_of(r, g, b) >= 128 else BUBBLE_ALPHA_DARK
+    fill = (BUBBLE_FILL[0], BUBBLE_FILL[1], BUBBLE_FILL[2], int(255 * a))
+
+    bubble_layer = Image.new("RGBA", canvas_rgba.size, (0, 0, 0, 0))
+    bd = ImageDraw.Draw(bubble_layer)
+    bd.rounded_rectangle([left, top, right, bottom], radius=radius, fill=fill)
+    canvas_rgba.alpha_composite(bubble_layer)
+
+    # текст по центру бабла (белый)
+    draw = ImageDraw.Draw(canvas_rgba)
+    bbox = draw.textbbox((0, 0), label, font=font)
+    txt_h = bbox[3] - bbox[1]
+    tx = center_x - tw / 2
+    ty = center_y - txt_h / 2 - bbox[1]
+    draw.text((tx, ty), label, font=font, fill=(255, 255, 255, 255))
+
+
+# ============ Обложка: рендер вариантов ============
+def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: str) -> Image.Image:
+    fmt = FORMATS[format_key]
+    if fmt is None:
+        if img.width < 1920:
+            scale = 1920 / img.width
+            canvas_w, canvas_h = 1920, int(img.height * scale)
+        else:
+            canvas_w, canvas_h = img.size
+    else:
+        canvas_w, canvas_h = fmt
+    scale = canvas_w / 1920
+
+    base = fit_image_to_canvas(img, canvas_w, canvas_h)
+
+    # градиент — по яркости в зоне заголовка
+    title_size = int(COVER_TITLE_SIZE_FEED * scale)
+    region_y = canvas_h - int(COVER_TITLE_BOTTOM_FEED * scale) - title_size * 2
+    br_r, br_g, br_b = get_average_color(base, 0, max(0, region_y), canvas_w, title_size * 2)
+    canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), int(GRAD_RISE_FEED * scale))
+
+    # заголовок
+    draw_centered_title(canvas, title, title_size, COVER_TITLE_LS_FEED,
+                        int(COVER_TITLE_BOTTOM_FEED * scale))
+
+    # бабл сверху по центру
+    bubble_h = int(FEED_BUBBLE_H * scale)
+    radius = int(FEED_BUBBLE_RADIUS * scale)
+    cy = int(FEED_BUBBLE_TOP * scale) + bubble_h // 2
+    bg_for_bubble = canvas.convert("RGB")
+    draw_bubble(canvas, hashtag, canvas_w // 2, cy, None, bubble_h, radius, bg_for_bubble)
+
+    # вордмарк снизу по центру (белый)
+    wm_w = int(WORDMARK_W_FEED * scale)
+    ratio = get_wordmark().height / get_wordmark().width
+    wm_h = round(wm_w * ratio)
+    wm_y = canvas_h - int(WORDMARK_BOTTOM_FEED * scale) - wm_h
+    paste_wordmark(canvas, wm_w, canvas_w // 2, wm_y)
+
+    return canvas.convert("RGB")
+
+
+def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str) -> Image.Image:
+    cw, ch = STORY_SIZE
+    if variant == "ig":
+        title_bottom = COVER_TITLE_BOTTOM_IG
+        b_w, b_h, b_r, b_bottom = IG_BUBBLE_W, IG_BUBBLE_H, IG_BUBBLE_RADIUS, IG_BUBBLE_BOTTOM
+    else:  # tg
+        title_bottom = COVER_TITLE_BOTTOM_TG
+        b_w, b_h, b_r, b_bottom = TG_BUBBLE_W, TG_BUBBLE_H, TG_BUBBLE_RADIUS, TG_BUBBLE_BOTTOM
+
+    base = fit_image_to_canvas(img, cw, ch)
+
+    # градиент по яркости в зоне заголовка
+    region_y = ch - title_bottom - COVER_TITLE_SIZE_STORY * 2
+    br_r, br_g, br_b = get_average_color(base, 0, max(0, region_y), cw, COVER_TITLE_SIZE_STORY * 2)
+    canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), GRAD_RISE_STORY)
+
+    # вордмарк сверху по центру (белый)
+    paste_wordmark(canvas, WORDMARK_W_STORY, cw // 2, WORDMARK_TOP_STORY)
+
+    # заголовок
+    draw_centered_title(canvas, title, COVER_TITLE_SIZE_STORY, COVER_TITLE_LS_STORY, title_bottom)
+
+    # бабл под заголовком (фиксированная ширина)
+    cy = ch - b_bottom - b_h // 2
+    bg_for_bubble = canvas.convert("RGB")
+    draw_bubble(canvas, hashtag, cw // 2, cy, b_w, b_h, b_r, bg_for_bubble)
+
+    return canvas.convert("RGB")
+
+
+# ============ Клавиатуры ============
+def type_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏷 Брендинг (Тип 1)", callback_data="type:type1")],
+        [InlineKeyboardButton("🖼 Обложка с текстом", callback_data="type:cover")],
+    ])
 
 
 def format_keyboard():
@@ -206,24 +443,36 @@ def format_keyboard():
 
 
 def hashtag_keyboard():
-    rows = []
-    row = []
+    rows, row = [], []
     for tag in HASHTAGS:
         row.append(InlineKeyboardButton(tag, callback_data=f"tag:{tag}"))
         if len(row) == 2:
-            rows.append(row)
-            row = []
+            rows.append(row); row = []
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
+# ============ Хендлеры ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
-        "👋 Привет! Я Post Creator для ÖMANKÖ.\n\n"
-        "📎 Отправляй фото как *файл* (скрепка → Файл), а не как обычное фото — так качество сохранится.\n\n"
-        "Отправь фото, затем /done",
+        "👋 Привет! Я Post Creator для ÖMANKÖ.\n\nЧто делаем?",
+        reply_markup=type_keyboard()
+    )
+    return CHOOSING_TYPE
+
+
+async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split(":", 1)[1]
+    context.user_data["mode"] = mode
+    name = "Обложка с текстом" if mode == "cover" else "Брендинг (Тип 1)"
+    await query.edit_message_text(
+        f"Режим: *{name}*\n\n"
+        "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
+        "Пришли фото, затем /done",
         parse_mode="Markdown"
     )
     return WAITING_PHOTOS
@@ -233,12 +482,10 @@ async def receive_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photos = context.user_data.setdefault("photos", [])
     if update.message.photo:
         file = await update.message.photo[-1].get_file()
-        data = await file.download_as_bytearray()
-        photos.append(bytes(data))
+        photos.append(bytes(await file.download_as_bytearray()))
     elif update.message.document and update.message.document.mime_type.startswith("image/"):
         file = await update.message.document.get_file()
-        data = await file.download_as_bytearray()
-        photos.append(bytes(data))
+        photos.append(bytes(await file.download_as_bytearray()))
     await update.message.reply_text(f"✅ {len(photos)} фото. Ещё или /done")
     return WAITING_PHOTOS
 
@@ -248,8 +495,27 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not photos:
         await update.message.reply_text("Сначала отправь хотя бы одно фото!")
         return WAITING_PHOTOS
+    if context.user_data.get("mode") == "cover":
+        await update.message.reply_text(
+            "✍️ Пришли *текст заголовка*.\n"
+            "Переносы строк ставь сам — как нужно на обложке.",
+            parse_mode="Markdown"
+        )
+        return WAITING_TITLE
     await update.message.reply_text(
-        f"📐 Выбери формат ({len(photos)} фото):",
+        f"📐 Выбери формат ({len(photos)} фото):", reply_markup=format_keyboard()
+    )
+    return CHOOSING_FORMAT
+
+
+async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = (update.message.text or "").strip("\n")
+    if not title.strip():
+        await update.message.reply_text("Заголовок пустой — пришли текст ещё раз.")
+        return WAITING_TITLE
+    context.user_data["title"] = title
+    await update.message.reply_text(
+        "📐 Выбери формат ленты (сторис IG и TG добавлю автоматически):",
         reply_markup=format_keyboard()
     )
     return CHOOSING_FORMAT
@@ -259,7 +525,7 @@ async def choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["format"] = query.data.split(":", 1)[1]
-    await query.edit_message_text("# Выбери хештег:", reply_markup=hashtag_keyboard())
+    await query.edit_message_text("Выбери хештег:", reply_markup=hashtag_keyboard())
     return CHOOSING_HASHTAG
 
 
@@ -269,16 +535,29 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hashtag = query.data.split(":", 1)[1]
     fmt = context.user_data.get("format", "4:5")
     photos = context.user_data.get("photos", [])
+    mode = context.user_data.get("mode", "type1")
+
     await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
 
     for i, photo_bytes in enumerate(photos):
         try:
             img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            result = process_image(img, fmt, hashtag)
-            buf = io.BytesIO()
-            result.save(buf, format="JPEG", quality=92)
-            buf.seek(0)
-            await query.message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
+            if mode == "cover":
+                title = context.user_data.get("title", "")
+                feed = render_cover_feed(img, fmt, title, hashtag)
+                ig = render_cover_story(img, "ig", title, hashtag)
+                tg = render_cover_story(img, "tg", title, hashtag)
+                for result, suffix in ((feed, "feed"), (ig, "ig"), (tg, "tg")):
+                    buf = io.BytesIO()
+                    result.save(buf, format="JPEG", quality=92)
+                    buf.seek(0)
+                    await query.message.reply_document(document=buf, filename=f"cover_{i+1}_{suffix}.jpg")
+            else:
+                result = process_image(img, fmt, hashtag)
+                buf = io.BytesIO()
+                result.save(buf, format="JPEG", quality=92)
+                buf.seek(0)
+                await query.message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
         except Exception as e:
             logger.error(f"Ошибка фото {i+1}: {e}")
             await query.message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
@@ -298,22 +577,22 @@ def main():
     app = (
         Application.builder()
         .token(TOKEN)
-        .read_timeout(120)
-        .write_timeout(120)
-        .connect_timeout(30)
+        .read_timeout(120).write_timeout(120).connect_timeout(30)
         .build()
     )
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
+            CHOOSING_TYPE: [CallbackQueryHandler(choose_type, pattern="^type:")],
             WAITING_PHOTOS: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photos),
                 CommandHandler("done", done),
             ],
+            WAITING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
             CHOOSING_FORMAT: [CallbackQueryHandler(choose_format, pattern="^fmt:")],
             CHOOSING_HASHTAG: [CallbackQueryHandler(choose_hashtag, pattern="^tag:")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     app.add_handler(conv)
     app.run_polling()
