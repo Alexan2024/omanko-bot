@@ -98,9 +98,9 @@ STORY_SIZE = (1080, 1920)
 # bubble_top — отступ бабла от верха; title_bottom — отступ заголовка от низа.
 COVER_FORMATS = {
     "4:5": dict(size=(1920, 2400), bubble_h=126, bubble_top=68, title_bottom=365),
-    "2:3": dict(size=(1920, 2560), bubble_h=126, bubble_top=68, title_bottom=365),
-    "1:1": dict(size=(2400, 2400), bubble_h=158, bubble_top=85, title_bottom=365),
-    "3:2": dict(size=(3600, 2400), bubble_h=126, bubble_top=68, title_bottom=390),
+    "2:3": dict(size=(1920, 2560), bubble_h=126, bubble_top=68, title_bottom=385),
+    "1:1": dict(size=(2400, 2400), bubble_h=158, bubble_top=85, title_bottom=411),
+    "3:2": dict(size=(3600, 2400), bubble_h=126, bubble_top=68, title_bottom=440),
 }
 # Адаптивный режим обложки использует параметры 4:5
 COVER_DEFAULT = dict(bubble_h=126, bubble_top=68, title_bottom=365)
