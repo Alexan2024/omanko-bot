@@ -53,11 +53,11 @@ ALPHA = 0.95
 # Заголовок (Nunito Sans Black)
 COVER_TITLE_SIZE_FEED = 135      # на ширину 1920
 COVER_TITLE_LS_FEED = -0.03      # letter-spacing -3%
-COVER_TITLE_BOTTOM_FEED = 390
+COVER_TITLE_BOTTOM_FEED = 436    # 390 + 46 (поднят выше)
 COVER_TITLE_SIZE_STORY = 77      # на канвас 1080x1920
 COVER_TITLE_LS_STORY = -0.06     # letter-spacing -6%
-COVER_TITLE_BOTTOM_IG = 424
-COVER_TITLE_BOTTOM_TG = 354
+COVER_TITLE_BOTTOM_IG = 452      # 424 + 28 (поднят выше)
+COVER_TITLE_BOTTOM_TG = 382      # 354 + 28 (поднят выше)
 COVER_LINE_SPACING = 1.08        # межстрочный множитель
 
 # Вордмарк ÖMANKÖ (всегда белый)
@@ -84,10 +84,12 @@ TG_BUBBLE_W = 430
 TG_BUBBLE_H = 115
 TG_BUBBLE_RADIUS = 17
 
-# Бабл: чёрный, полупрозрачный, адаптивный по фону
-BUBBLE_ALPHA_DARK = 0.30         # фон тёмный → слабее
-BUBBLE_ALPHA_LIGHT = 0.45        # фон светлый → плотнее
-BUBBLE_FILL = (0, 0, 0)
+# Бабл в ленте: тёмный, почти непрозрачный, с хештегом внутри
+FEED_BUBBLE_ALPHA = 0.85
+FEED_BUBBLE_FILL = (0, 0, 0)
+# Бабл в сторис: ПУСТОЙ (без хештега), цвет инвертный к фону:
+#   тёмный фон → светлый бабл, светлый фон → тёмный бабл
+STORY_BUBBLE_ALPHA = 0.50
 
 # Градиент под заголовком: чёрный снизу вверх, адаптивный
 GRAD_ALPHA_DARK = 0.18           # фон тёмный → слабый градиент
@@ -319,15 +321,15 @@ def draw_centered_title(canvas_rgba: Image.Image, text: str, size: int,
             x += w + ls_px
 
 
-def draw_bubble(canvas_rgba: Image.Image, hashtag: str, center_x: int, center_y: int,
-                bubble_w, bubble_h: int, radius: int, bg_img: Image.Image):
-    """Бабл с хештегом. bubble_w=None -> авто-ширина под текст (лента)."""
-    if not hashtag or hashtag == "— Без хештега —":
-        return
-    label = "# " + hashtag.lstrip("#")
-    font = load_semibold(BUBBLE_TEXT_SIZE)
-    draw = ImageDraw.Draw(canvas_rgba)
-    tw = draw.textlength(label, font=font)
+def draw_bubble(canvas_rgba: Image.Image, center_x: int, center_y: int,
+                bubble_w, bubble_h: int, radius: int, bg_img: Image.Image,
+                label=None, color_mode="dark", alpha=0.85):
+    """Бабл. label=None -> пустой бабл (сторис).
+    color_mode: 'dark' (фикс. тёмный, лента) | 'adaptive_invert' (инверт к фону, сторис).
+    bubble_w=None -> авто-ширина под текст (лента)."""
+    font = load_semibold(BUBBLE_TEXT_SIZE) if label else None
+    d = ImageDraw.Draw(canvas_rgba)
+    tw = d.textlength(label, font=font) if label else 0
     if bubble_w is None:
         bubble_w = int(tw + 2 * FEED_BUBBLE_PAD_X)
     left = int(center_x - bubble_w / 2)
@@ -335,23 +337,26 @@ def draw_bubble(canvas_rgba: Image.Image, hashtag: str, center_x: int, center_y:
     right = left + bubble_w
     bottom = top + bubble_h
 
-    # адаптивная плотность бабла по фону под ним
+    # цвет фона под баблом
     r, g, b = get_average_color(bg_img, left, top, bubble_w, bubble_h)
-    a = BUBBLE_ALPHA_LIGHT if brightness_of(r, g, b) >= 128 else BUBBLE_ALPHA_DARK
-    fill = (BUBBLE_FILL[0], BUBBLE_FILL[1], BUBBLE_FILL[2], int(255 * a))
+    dark_bg = brightness_of(r, g, b) < 128
+    if color_mode == "adaptive_invert":
+        fill_rgb = (255, 255, 255) if dark_bg else (0, 0, 0)
+    else:
+        fill_rgb = FEED_BUBBLE_FILL
+    fill = (fill_rgb[0], fill_rgb[1], fill_rgb[2], int(255 * alpha))
 
-    bubble_layer = Image.new("RGBA", canvas_rgba.size, (0, 0, 0, 0))
-    bd = ImageDraw.Draw(bubble_layer)
-    bd.rounded_rectangle([left, top, right, bottom], radius=radius, fill=fill)
-    canvas_rgba.alpha_composite(bubble_layer)
+    layer = Image.new("RGBA", canvas_rgba.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle([left, top, right, bottom], radius=radius, fill=fill)
+    canvas_rgba.alpha_composite(layer)
 
-    # текст по центру бабла (белый)
-    draw = ImageDraw.Draw(canvas_rgba)
-    bbox = draw.textbbox((0, 0), label, font=font)
-    txt_h = bbox[3] - bbox[1]
-    tx = center_x - tw / 2
-    ty = center_y - txt_h / 2 - bbox[1]
-    draw.text((tx, ty), label, font=font, fill=(255, 255, 255, 255))
+    if label:
+        d = ImageDraw.Draw(canvas_rgba)
+        bbox = d.textbbox((0, 0), label, font=font)
+        txt_h = bbox[3] - bbox[1]
+        tx = center_x - tw / 2
+        ty = center_y - txt_h / 2 - bbox[1]
+        d.text((tx, ty), label, font=font, fill=(255, 255, 255, 255))
 
 
 # ============ Обложка: рендер вариантов ============
@@ -379,12 +384,15 @@ def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: st
     draw_centered_title(canvas, title, title_size, COVER_TITLE_LS_FEED,
                         int(COVER_TITLE_BOTTOM_FEED * scale))
 
-    # бабл сверху по центру
-    bubble_h = int(FEED_BUBBLE_H * scale)
-    radius = int(FEED_BUBBLE_RADIUS * scale)
-    cy = int(FEED_BUBBLE_TOP * scale) + bubble_h // 2
-    bg_for_bubble = canvas.convert("RGB")
-    draw_bubble(canvas, hashtag, canvas_w // 2, cy, None, bubble_h, radius, bg_for_bubble)
+    # бабл сверху по центру — тёмный плотный, с хештегом
+    if hashtag and hashtag != "— Без хештега —":
+        bubble_h = int(FEED_BUBBLE_H * scale)
+        radius = int(FEED_BUBBLE_RADIUS * scale)
+        cy = int(FEED_BUBBLE_TOP * scale) + bubble_h // 2
+        bg_for_bubble = canvas.convert("RGB")
+        label = "# " + hashtag.lstrip("#")
+        draw_bubble(canvas, canvas_w // 2, cy, None, bubble_h, radius, bg_for_bubble,
+                    label=label, color_mode="dark", alpha=FEED_BUBBLE_ALPHA)
 
     # вордмарк снизу по центру (белый)
     wm_w = int(WORDMARK_W_FEED * scale)
@@ -418,10 +426,11 @@ def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str)
     # заголовок
     draw_centered_title(canvas, title, COVER_TITLE_SIZE_STORY, COVER_TITLE_LS_STORY, title_bottom)
 
-    # бабл под заголовком (фиксированная ширина)
+    # бабл под заголовком — ПУСТОЙ (без хештега), цвет инвертный к фону
     cy = ch - b_bottom - b_h // 2
     bg_for_bubble = canvas.convert("RGB")
-    draw_bubble(canvas, hashtag, cw // 2, cy, b_w, b_h, b_r, bg_for_bubble)
+    draw_bubble(canvas, cw // 2, cy, b_w, b_h, b_r, bg_for_bubble,
+                label=None, color_mode="adaptive_invert", alpha=STORY_BUBBLE_ALPHA)
 
     return canvas.convert("RGB")
 
