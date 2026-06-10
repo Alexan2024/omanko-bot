@@ -94,7 +94,7 @@ HASHTAGS = [
     "— Без хештега —",
     "#architecture", "#cars", "#cinema", "#archives",
     "#art", "#community", "#item", "#music",
-    "#paper", "#space", "#style", "#beauty", "#fashion"
+    "#paper", "#space", "#style", "#beauty", "#fashion", "#agency"
 ]
 
 # ============ Тип 1 (брендинг) — БЕЗ ИЗМЕНЕНИЙ ============
