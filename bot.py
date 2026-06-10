@@ -183,20 +183,20 @@ CHANNELS = {
                "type1_logo": None, "type1_box": None,
                "story_logo": None, "story_box": None},
     "news":   {"title": "Ö NEWS",
-               "type1_logo": "logo_type1_news.png",   "type1_box": (72, 112, 117, 41),
-               "story_logo": "logo_cover_news.png",    "story_box": (196, 99)},
+               "type1_logo": "logo_type1_news.png",   "type1_box": (72, 112, 91, 47),
+               "story_logo": "logo_cover_news.png",    "story_box": (196, 81)},
     "beauty": {"title": "Ö BEAUTY",
-               "type1_logo": "logo_type1_beauty.png", "type1_box": (72, 107, 117, 46),
-               "story_logo": "logo_cover_beauty.png",  "story_box": (196, 99)},
+               "type1_logo": "logo_type1_beauty.png", "type1_box": (72, 107, 91, 52),
+               "story_logo": "logo_cover_beauty.png",  "story_box": (196, 81)},
     "music":  {"title": "Ö MUSIC",
-               "type1_logo": "logo_type1_music.png",  "type1_box": (89, 107, 117, 46),
-               "story_logo": "logo_cover_music.png",   "story_box": (196, 99)},
+               "type1_logo": "logo_type1_music.png",  "type1_box": (89, 107, 91, 52),
+               "story_logo": "logo_cover_music.png",   "story_box": (196, 81)},
     "agency": {"title": "Ö AGENCY",  # спека пока не задана — базовое поведение
                "type1_logo": None, "type1_box": None,
                "story_logo": None, "story_box": None},
     "gastro": {"title": "Ö GASTRO",
-               "type1_logo": "logo_type1_gastro.png", "type1_box": (75, 119, 117, 34),
-               "story_logo": "logo_cover_gastro.png",  "story_box": (196, 99)},
+               "type1_logo": "logo_type1_gastro.png", "type1_box": (75, 119, 91, 40),
+               "story_logo": "logo_cover_gastro.png",  "story_box": (196, 81)},
 }
 
 BASE_WORDMARK_FILE = "wordmark_white.png"  # широкий ÖMANKÖ: лента + база сторис
