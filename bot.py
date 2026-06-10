@@ -23,6 +23,7 @@ WAITING_PHOTOS = 1
 CHOOSING_FORMAT = 2
 CHOOSING_HASHTAG = 3
 WAITING_TITLE = 4
+CHOOSING_CHANNEL = 5
 
 # Состояния рассылки (отдельный диалог, значения не пересекаются с основным)
 BROADCAST_MSG = 100
@@ -164,7 +165,59 @@ COVER_FORMATS = {
 # Адаптивный режим обложки использует параметры 4:5
 COVER_DEFAULT = dict(bubble_h=126, bubble_top=68, title_bottom=365)
 
-_WORDMARK = None
+# ============ Каналы сетки ============
+# У каждого канала ДВА варианта лого (белые PNG, прозрачный фон):
+#   type1_logo  — для режима «Тип 1» (угловой логотип внизу слева)
+#   story_logo  — для обложек, используется ТОЛЬКО в сторис (IG/TG)
+# Геометрия:
+#   type1_box = (w, h, left, bottom) в координатах канваса 1920px (как LOGO_*),
+#               масштабируется вместе с лентой.
+#   story_box = (w, h) в координатах сторис 1080×1920; отступ сверху общий
+#               (WORDMARK_TOP_STORY), лого центрируется по горизонтали.
+# None в поле лого/бокса => базовое поведение:
+#   type1 None  -> рисуем векторный Ö (адаптивный, размеры LOGO_*)
+#   story None  -> широкий вордмарк ÖMANKÖ (как раньше)
+# В ЛЕНТЕ обложки вордмарк ВСЕГДА базовый ÖMANKÖ (по каналу не меняется).
+CHANNELS = {
+    "base":   {"title": "основа ÖMANKÖ",
+               "type1_logo": None, "type1_box": None,
+               "story_logo": None, "story_box": None},
+    "news":   {"title": "Ö NEWS",
+               "type1_logo": "logo_type1_news.png",   "type1_box": (72, 112, 117, 41),
+               "story_logo": "logo_cover_news.png",    "story_box": (196, 99)},
+    "beauty": {"title": "Ö BEAUTY",
+               "type1_logo": "logo_type1_beauty.png", "type1_box": (72, 107, 117, 46),
+               "story_logo": "logo_cover_beauty.png",  "story_box": (196, 99)},
+    "music":  {"title": "Ö MUSIC",
+               "type1_logo": "logo_type1_music.png",  "type1_box": (89, 107, 117, 46),
+               "story_logo": "logo_cover_music.png",   "story_box": (196, 99)},
+    "agency": {"title": "Ö AGENCY",  # спека пока не задана — базовое поведение
+               "type1_logo": None, "type1_box": None,
+               "story_logo": None, "story_box": None},
+    "gastro": {"title": "Ö GASTRO",
+               "type1_logo": "logo_type1_gastro.png", "type1_box": (75, 119, 117, 34),
+               "story_logo": "logo_cover_gastro.png",  "story_box": (196, 99)},
+}
+
+BASE_WORDMARK_FILE = "wordmark_white.png"  # широкий ÖMANKÖ: лента + база сторис
+
+# Кэши: базовый вордмарк и логотипы каналов (грузим с диска один раз)
+_WORDMARK_CACHE = {}
+_LOGO_CACHE = {}
+
+
+def _load_logo(fname: str):
+    """Загрузка PNG-логотипа канала с кэшем. None, если файла нет."""
+    if fname in _LOGO_CACHE:
+        return _LOGO_CACHE[fname]
+    path = os.path.join(BASE, fname)
+    if not os.path.exists(path):
+        logger.warning("Лого канала '%s' не найдено — откат на базовое поведение", fname)
+        _LOGO_CACHE[fname] = None
+        return None
+    img = Image.open(path).convert("RGBA")
+    _LOGO_CACHE[fname] = img
+    return img
 
 
 # ============ Общие утилиты ============
@@ -241,10 +294,44 @@ def load_black(size: int) -> ImageFont.FreeTypeFont:
 
 
 def get_wordmark() -> Image.Image:
-    global _WORDMARK
-    if _WORDMARK is None:
-        _WORDMARK = Image.open(os.path.join(BASE, "wordmark_white.png")).convert("RGBA")
-    return _WORDMARK
+    """Базовый широкий вордмарк ÖMANKÖ (белый). Используется в ленте обложки
+    и как фолбэк в сторис для каналов без своего story-лого."""
+    if "_base" in _WORDMARK_CACHE:
+        return _WORDMARK_CACHE["_base"]
+    img = Image.open(os.path.join(BASE, BASE_WORDMARK_FILE)).convert("RGBA")
+    _WORDMARK_CACHE["_base"] = img
+    return img
+
+
+def _tint_white_logo(logo: Image.Image, color: tuple, alpha: float) -> Image.Image:
+    """Заливает непрозрачные пиксели белого силуэта цветом `color`,
+    сохраняя альфа-края. `alpha` — общая прозрачность (0..1)."""
+    r, g, b = int(color[0]), int(color[1]), int(color[2])
+    solid = Image.new("RGBA", logo.size, (r, g, b, 0))
+    a = logo.split()[3].point(lambda p: int(p * alpha))
+    solid.putalpha(a)
+    return solid
+
+
+def paste_type1_channel_logo(canvas_rgba, fname, x, y, w, h, color):
+    """Тип 1: вставка лого канала, перекрашенного под фон (адаптивно)."""
+    logo = _load_logo(fname)
+    if logo is None:
+        return False
+    resized = logo.resize((w, h), Image.LANCZOS)
+    tinted = _tint_white_logo(resized, color, ALPHA)
+    canvas_rgba.alpha_composite(tinted, (x, y))
+    return True
+
+
+def paste_story_channel_logo(canvas_rgba, fname, cx, y_top, w, h):
+    """Сторис обложки: вставка лого канала фиксированного размера (белый, как есть)."""
+    logo = _load_logo(fname)
+    if logo is None:
+        return False
+    resized = logo.resize((w, h), Image.LANCZOS)
+    canvas_rgba.alpha_composite(resized, (int(cx - w / 2), y_top))
+    return True
 
 
 # ============ Тип 1: логотип Ö (без изменений) ============
@@ -265,8 +352,9 @@ def draw_logo(canvas: Image.Image, x: int, y: int, w: int, h: int, color: tuple)
     canvas.paste(logo, (x, y), logo)
 
 
-def process_image(img: Image.Image, format_key: str, hashtag: str) -> Image.Image:
-    """ТИП 1 — брендинг (логика без изменений)."""
+def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str = "base") -> Image.Image:
+    """ТИП 1 — брендинг. Логотип: у базового/agency — векторный Ö (как раньше),
+    у остальных каналов — свой PNG-логотип своего размера, адаптивно перекрашенный."""
     fmt = FORMATS[format_key]
     if fmt is None:
         if img.width < 1920:
@@ -279,22 +367,38 @@ def process_image(img: Image.Image, format_key: str, hashtag: str) -> Image.Imag
         canvas_w, canvas_h = fmt
 
     scale = canvas_w / 1920
-    logo_w = int(LOGO_W * scale)
-    logo_h = int(LOGO_H * scale)
-    logo_x = int(LOGO_LEFT * scale)
-    logo_y = canvas_h - int(LOGO_BOTTOM * scale) - logo_h
+
+    # Геометрия логотипа: своя у канала (type1_box), иначе дефолтные LOGO_*
+    ch = CHANNELS.get(channel, CHANNELS["base"])
+    if ch["type1_box"]:
+        bw, bh, bleft, bbottom = ch["type1_box"]
+        logo_w = int(bw * scale)
+        logo_h = int(bh * scale)
+        logo_x = int(bleft * scale)
+        logo_y = canvas_h - int(bbottom * scale) - logo_h
+    else:
+        logo_w = int(LOGO_W * scale)
+        logo_h = int(LOGO_H * scale)
+        logo_x = int(LOGO_LEFT * scale)
+        logo_y = canvas_h - int(LOGO_BOTTOM * scale) - logo_h
+
     hashtag_right = int(HASHTAG_RIGHT * scale)
     hashtag_bottom = int(HASHTAG_BOTTOM * scale)
     hashtag_size = int(HASHTAG_SIZE * scale)
 
     canvas = fit_image_to_canvas(img, canvas_w, canvas_h)
 
-    # ЛОГОТИП
+    # ЛОГОТИП — адаптивный цвет по фону под ним
     r, g, b = get_average_color(canvas, logo_x, logo_y, logo_w, logo_h)
     percent = BRIGHTNESS_OFFSET if brightness_of(r, g, b) < 128 else -BRIGHTNESS_OFFSET
     logo_color = adjust_brightness(r, g, b, percent)
     canvas_rgba = canvas.convert("RGBA")
-    draw_logo(canvas_rgba, logo_x, logo_y, logo_w, logo_h, logo_color)
+    placed = False
+    if ch["type1_logo"]:
+        placed = paste_type1_channel_logo(canvas_rgba, ch["type1_logo"],
+                                          logo_x, logo_y, logo_w, logo_h, logo_color)
+    if not placed:
+        draw_logo(canvas_rgba, logo_x, logo_y, logo_w, logo_h, logo_color)
     canvas = canvas_rgba.convert("RGB")
 
     # ХЕШТЕГ
@@ -468,7 +572,7 @@ def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: st
         draw_bubble(canvas, canvas_w // 2, cy, None, bubble_h, radius, bg_for_bubble,
                     label=label, color_mode="dark", alpha=FEED_BUBBLE_ALPHA)
 
-    # вордмарк снизу по центру (белый)
+    # вордмарк снизу по центру — в ленте ВСЕГДА базовый ÖMANKÖ (по каналу не меняется)
     ratio = get_wordmark().height / get_wordmark().width
     wm_h = round(wm_w * ratio)
     wm_y = canvas_h - wm_bottom - wm_h
@@ -477,7 +581,7 @@ def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: st
     return canvas.convert("RGB")
 
 
-def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str) -> Image.Image:
+def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str, channel: str = "base") -> Image.Image:
     cw, ch = STORY_SIZE
     if variant == "ig":
         title_bottom = COVER_TITLE_BOTTOM_IG
@@ -493,8 +597,16 @@ def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str)
     br_r, br_g, br_b = get_average_color(base, 0, max(0, region_y), cw, COVER_TITLE_SIZE_STORY * 2)
     canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), GRAD_RISE_STORY)
 
-    # вордмарк сверху по центру (белый)
-    paste_wordmark(canvas, WORDMARK_W_STORY, cw // 2, WORDMARK_TOP_STORY)
+    # лого сверху по центру:
+    #  - канал со своим story-лого → фиксированный размер (story_box), белый как есть
+    #  - база/agency → широкий вордмарк ÖMANKÖ (как раньше)
+    chan = CHANNELS.get(channel, CHANNELS["base"])
+    placed = False
+    if chan["story_logo"] and chan["story_box"]:
+        lw, lh = chan["story_box"]
+        placed = paste_story_channel_logo(canvas, chan["story_logo"], cw // 2, WORDMARK_TOP_STORY, lw, lh)
+    if not placed:
+        paste_wordmark(canvas, WORDMARK_W_STORY, cw // 2, WORDMARK_TOP_STORY)
 
     # заголовок
     draw_centered_title(canvas, title, COVER_TITLE_SIZE_STORY, COVER_TITLE_LS_STORY, title_bottom)
@@ -513,6 +625,17 @@ def type_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🏷 Брендинг (Тип 1)", callback_data="type:type1")],
         [InlineKeyboardButton("🖼 Обложка с текстом", callback_data="type:cover")],
+    ])
+
+
+def channel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(CHANNELS["base"]["title"], callback_data="channel:base")],
+        [InlineKeyboardButton(CHANNELS["news"]["title"], callback_data="channel:news"),
+         InlineKeyboardButton(CHANNELS["beauty"]["title"], callback_data="channel:beauty")],
+        [InlineKeyboardButton(CHANNELS["music"]["title"], callback_data="channel:music"),
+         InlineKeyboardButton(CHANNELS["agency"]["title"], callback_data="channel:agency")],
+        [InlineKeyboardButton(CHANNELS["gastro"]["title"], callback_data="channel:gastro")],
     ])
 
 
@@ -553,7 +676,26 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = mode
     name = "Обложка с текстом" if mode == "cover" else "Брендинг (Тип 1)"
     await query.edit_message_text(
-        f"Режим: *{name}*\n\n"
+        f"Режим: *{name}*\n\nТеперь выбери канал:",
+        parse_mode="Markdown",
+        reply_markup=channel_keyboard()
+    )
+    return CHOOSING_CHANNEL
+
+
+async def choose_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    channel = query.data.split(":", 1)[1]
+    if channel not in CHANNELS:
+        channel = "base"
+    context.user_data["channel"] = channel
+    note = ""
+    if context.user_data.get("mode") != "cover":
+        note = "_(в Тип 1 логотип Ö общий для всех каналов)_\n\n"
+    await query.edit_message_text(
+        f"Канал: *{CHANNELS[channel]['title']}*\n\n"
+        f"{note}"
         "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
         "Пришли фото, затем /done",
         parse_mode="Markdown"
@@ -619,6 +761,7 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fmt = context.user_data.get("format", "4:5")
     photos = context.user_data.get("photos", [])
     mode = context.user_data.get("mode", "type1")
+    channel = context.user_data.get("channel", "base")
 
     await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
 
@@ -628,15 +771,15 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if mode == "cover":
                 title = context.user_data.get("title", "")
                 feed = render_cover_feed(img, fmt, title, hashtag)
-                ig = render_cover_story(img, "ig", title, hashtag)
-                tg = render_cover_story(img, "tg", title, hashtag)
+                ig = render_cover_story(img, "ig", title, hashtag, channel=channel)
+                tg = render_cover_story(img, "tg", title, hashtag, channel=channel)
                 for result, suffix in ((feed, "feed"), (ig, "ig"), (tg, "tg")):
                     buf = io.BytesIO()
                     result.save(buf, format="JPEG", quality=92)
                     buf.seek(0)
                     await query.message.reply_document(document=buf, filename=f"cover_{i+1}_{suffix}.jpg")
             else:
-                result = process_image(img, fmt, hashtag)
+                result = process_image(img, fmt, hashtag, channel=channel)
                 buf = io.BytesIO()
                 result.save(buf, format="JPEG", quality=92)
                 buf.seek(0)
@@ -760,6 +903,7 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             CHOOSING_TYPE: [CallbackQueryHandler(choose_type, pattern="^type:")],
+            CHOOSING_CHANNEL: [CallbackQueryHandler(choose_channel, pattern="^channel:")],
             WAITING_PHOTOS: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photos),
                 CommandHandler("done", done),
