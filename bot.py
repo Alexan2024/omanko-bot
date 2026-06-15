@@ -3,6 +3,7 @@ import io
 import json
 import asyncio
 import logging
+from datetime import datetime, time as dtime, timezone, timedelta
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,20 +38,27 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 
 
-def _users_path():
-    """Файл со списком пользователей. Предпочитаем постоянный том /data,
-    иначе пишем рядом с ботом (на Railway это эфемерно — переживёт работу,
-    но не передеплой; поэтому в Railway нужен Volume на /data)."""
-    for d in ("/data", BASE):
+def _resolve_data_dir():
+    """Где хранить users.json и stats.json так, чтобы пережило передеплой.
+    Railway сам выставляет RAILWAY_VOLUME_MOUNT_PATH, когда к сервису подключён
+    Volume — это самый надёжный признак постоянного хранилища. Если его нет,
+    пробуем /data (на случай ручного монтирования), иначе пишем рядом с ботом —
+    но это эфемерно: при следующем деплое всё обнулится.
+    Возвращает (папка, постоянное_ли)."""
+    vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    candidates = ([(vol, True)] if vol else []) + [("/data", False), (BASE, False)]
+    for d, persistent in candidates:
         try:
             if os.path.isdir(d) and os.access(d, os.W_OK):
-                return os.path.join(d, "users.json")
+                return d, persistent
         except Exception:
             pass
-    return os.path.join(BASE, "users.json")
+    return BASE, False
 
 
-USERS_FILE = _users_path()
+DATA_DIR, STORAGE_PERSISTENT = _resolve_data_dir()
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 
 
 def load_users() -> set:
@@ -82,6 +90,128 @@ def remove_users(ids) -> None:
     users = load_users()
     users -= set(ids)
     save_users(users)
+
+
+# ============ Статистика производства ============
+# Один завершённый цикл (нажал /start → выбрал тип/канал → прислал фото →
+# получил картинки) = один «пост». В цикле может быть несколько фото — это
+# «обработанные фотографии». Каждое событие пишем в stats.json одной строкой:
+# дата (UTC, ISO), канал, режим (type1/cover), сколько фото реально обработано.
+
+MSK = timezone(timedelta(hours=3))  # Москва — UTC+3, без переходов на летнее
+_STATS_CAP = 5000  # держим файл в узде: храним последние N событий
+_RU_MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+def load_stats() -> list:
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_stats(events) -> None:
+    try:
+        tmp = STATS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(events, f, ensure_ascii=False)
+        os.replace(tmp, STATS_FILE)
+    except Exception as e:
+        logger.error(f"Не смог сохранить статистику: {e}")
+
+
+def record_post(channel: str, mode: str, n_photos: int) -> None:
+    if n_photos <= 0:
+        return
+    events = load_stats()
+    events.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "channel": channel,
+        "mode": mode if mode in ("type1", "cover") else "type1",
+        "photos": int(n_photos),
+    })
+    if len(events) > _STATS_CAP:
+        events = events[-_STATS_CAP:]
+    save_stats(events)
+
+
+def _plural_post(n: int) -> str:
+    n100, n10 = abs(n) % 100, abs(n) % 10
+    if 11 <= n100 <= 14:
+        return "постов"
+    if n10 == 1:
+        return "пост"
+    if 2 <= n10 <= 4:
+        return "поста"
+    return "постов"
+
+
+def _ru_date(d: datetime) -> str:
+    return f"{d.day} {_RU_MONTHS[d.month]}"
+
+
+def build_weekly_report(events, until=None) -> str:
+    """Сводка за 7 дней до момента until (по МСК): всего и по каналам +
+    разбивка фото по типам."""
+    until = until or datetime.now(MSK)
+    since = until - timedelta(days=7)
+
+    chans = {k: {"posts": 0, "photos": 0} for k in CHANNELS}
+    total_posts = total_photos = type1_photos = cover_photos = 0
+
+    for e in events:
+        try:
+            ts = datetime.fromisoformat(e["ts"])
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ts = ts.astimezone(MSK)
+        if not (since < ts <= until):
+            continue
+        ch = e.get("channel", "base")
+        if ch not in chans:
+            ch = "base"
+        ph = int(e.get("photos", 0))
+        chans[ch]["posts"] += 1
+        chans[ch]["photos"] += ph
+        total_posts += 1
+        total_photos += ph
+        if e.get("mode") == "cover":
+            cover_photos += ph
+        else:
+            type1_photos += ph
+
+    period = f"{_ru_date(since)} — {_ru_date(until)}"
+    if total_posts == 0:
+        return (f"📊 *Итоги недели* ({period})\n\n"
+                "Тишина в эфире — за неделю ни одного поста. "
+                "Контент сам себя не сделает 😉")
+
+    lines = [
+        f"📊 *Итоги недели* ({period})",
+        "",
+        f"🔥 Всего: *{total_posts}* {_plural_post(total_posts)} · "
+        f"*{total_photos}* фото",
+        "",
+        "*По каналам:*",
+    ]
+    for k in CHANNELS:
+        c = chans[k]
+        if c["posts"] == 0:
+            continue
+        lines.append(f"• {CHANNELS[k]['title']}: "
+                     f"{c['posts']} {_plural_post(c['posts'])}, {c['photos']} фото")
+    lines += [
+        "",
+        "*По типам (фото):*",
+        f"🏷 Тип 1 — {type1_photos}",
+        f"🖼 Обложка — {cover_photos}",
+    ]
+    return "\n".join(lines)
 
 FORMATS = {
     "4:5": (1920, 2400),
@@ -765,6 +895,7 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
 
+    ok = 0
     for i, photo_bytes in enumerate(photos):
         try:
             img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
@@ -784,10 +915,12 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result.save(buf, format="JPEG", quality=92)
                 buf.seek(0)
                 await query.message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
+            ok += 1
         except Exception as e:
             logger.error(f"Ошибка фото {i+1}: {e}")
             await query.message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
 
+    record_post(channel, mode, ok)
     context.user_data.clear()
     await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
     return ConversationHandler.END
@@ -892,6 +1025,38 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def weekly_stats_job(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в день срабатывает в 21:00 МСК; шлём отчёт только по пятницам."""
+    now = datetime.now(MSK)
+    if now.weekday() != 4:  # 4 = пятница (Пн=0 … Вс=6)
+        return
+    if ADMIN_ID == 0:
+        logger.warning("Еженедельный отчёт: ADMIN_ID не задан — некому слать.")
+        return
+    report = build_weekly_report(load_stats(), until=now)
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=report, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Не смог отправить еженедельный отчёт: {e}")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика по запросу (за последние 7 дней) + состояние хранилища.
+    Пока ADMIN_ID не задан — отвечает всем, потом только админу."""
+    uid = update.effective_user.id
+    if ADMIN_ID != 0 and uid != ADMIN_ID:
+        return
+    report = build_weekly_report(load_stats())
+    storage = ("🟢 постоянное (Railway Volume) — переживёт деплой"
+               if STORAGE_PERSISTENT else
+               "🔴 ВРЕМЕННОЕ — данные обнулятся при следующем деплое. "
+               "Подключи Volume в Railway (mount path любой, бот подхватит сам).")
+    await update.message.reply_text(
+        f"{report}\n\n_Хранилище: {storage}_",
+        parse_mode="Markdown"
+    )
+
+
 def main():
     app = (
         Application.builder()
@@ -923,8 +1088,26 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(bc_conv)
     app.add_handler(conv)
+
+    logger.info(
+        f"Хранилище: {DATA_DIR} "
+        f"({'постоянное (Volume)' if STORAGE_PERSISTENT else 'ВРЕМЕННОЕ — нужен Volume!'})"
+    )
+    if app.job_queue:
+        app.job_queue.run_daily(
+            weekly_stats_job,
+            time=dtime(hour=21, minute=0, tzinfo=MSK),
+        )
+        logger.info("Еженедельный отчёт: запланирован на пятницу 21:00 МСК.")
+    else:
+        logger.warning(
+            "JobQueue недоступна — еженедельный отчёт не запустится. "
+            "Нужно: python-telegram-bot[job-queue] в requirements.txt."
+        )
+
     app.run_polling()
 
 
