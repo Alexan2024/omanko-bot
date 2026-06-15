@@ -209,7 +209,7 @@ def build_weekly_report(events, until=None) -> str:
     lines += [
         "",
         "*По типам (фото):*",
-        f"🏷 Тип 1 — {type1_photos}",
+        f"🏷 Брендинг — {type1_photos}",
         f"🖼 Обложка — {cover_photos}",
     ]
     return "\n".join(lines)
@@ -767,8 +767,8 @@ def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str,
 # ============ Клавиатуры ============
 def type_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏷 Брендинг (Тип 1)", callback_data="type:type1")],
-        [InlineKeyboardButton("🖼 Обложка с текстом", callback_data="type:cover")],
+        [InlineKeyboardButton("🏷 Брендинг", callback_data="type:type1")],
+        [InlineKeyboardButton("🖼 Обложка", callback_data="type:cover")],
     ])
 
 
@@ -822,7 +822,7 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     mode = query.data.split(":", 1)[1]
     context.user_data["mode"] = mode
-    name = "Обложка с текстом" if mode == "cover" else "Брендинг (Тип 1)"
+    name = "Обложка" if mode == "cover" else "Брендинг"
     await query.edit_message_text(
         f"Режим: *{name}*\n\nТеперь выбери канал:",
         parse_mode="Markdown",
