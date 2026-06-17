@@ -476,7 +476,14 @@ STORY_BUBBLE_ALPHA = 0.50
 # Градиент под заголовком: чёрный снизу вверх, адаптивный
 GRAD_ALPHA_DARK = 0.18           # фон тёмный → слабый градиент
 GRAD_ALPHA_LIGHT = 0.62          # фон светлый → плотный
+GRAD_ALPHA_CEIL = 0.92           # потолок плотности (чтобы низ не уходил в полную черноту)
 GRAD_RISE_STORY = 900            # высота градиента над низом (на 1080w)
+
+# Ручной регулятор затемнения обложек: ступени множителя к адаптивной базе.
+# Индекс DARK_DEFAULT_IDX == множитель 1.0 == текущее (адаптивное) поведение.
+DARK_LEVELS = [0.45, 0.7, 1.0, 1.35, 1.75]
+DARK_DEFAULT_IDX = 2
+DARK_LEVEL_NAMES = ["min", "светлее", "норма", "темнее", "max"]
 
 STORY_SIZE = (1080, 1920)
 
@@ -770,11 +777,22 @@ def paste_wordmark(canvas_rgba: Image.Image, target_w: int, cx: int, y_top: int)
     return target_h
 
 
-def apply_bottom_gradient(canvas: Image.Image, brightness: float, rise: int) -> Image.Image:
-    """Чёрный градиент снизу вверх. Плотность зависит от яркости фона."""
+def apply_bottom_gradient(canvas: Image.Image, brightness: float, rise: int,
+                          dark_level: float = 1.0) -> Image.Image:
+    """Чёрный градиент снизу вверх.
+
+    Плотность складывается из двух частей:
+      • АДАПТИВ — базовая alpha по яркости фона в зоне заголовка (тёмный фон →
+        слабый градиент, светлый → плотный). Это поведение при dark_level=1.0.
+      • РУЧНОЙ множитель dark_level — масштабирует базовую alpha (Светлее/Темнее).
+        1.0 = как было; <1 светлее; >1 темнее. Итог клампим, чтобы фон не уходил
+        в полную черноту.
+    """
     cw, ch = canvas.size
     t = max(0.0, min(1.0, brightness / 255.0))
-    max_alpha = int(255 * (GRAD_ALPHA_DARK + (GRAD_ALPHA_LIGHT - GRAD_ALPHA_DARK) * t))
+    base_alpha = GRAD_ALPHA_DARK + (GRAD_ALPHA_LIGHT - GRAD_ALPHA_DARK) * t
+    alpha = max(0.0, min(GRAD_ALPHA_CEIL, base_alpha * dark_level))
+    max_alpha = int(255 * alpha)
     rise = min(rise, ch)
     # вертикальный градиент: 0 сверху rise-зоны -> max_alpha у низа
     ramp = np.linspace(0, max_alpha, rise).astype(np.uint8).reshape(-1, 1)
@@ -855,7 +873,8 @@ def draw_bubble(canvas_rgba: Image.Image, center_x: int, center_y: int,
 
 
 # ============ Обложка: рендер вариантов ============
-def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: str) -> Image.Image:
+def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: str,
+                      dark_level: float = 1.0) -> Image.Image:
     spec = COVER_FORMATS.get(format_key)
     if spec is None:
         # Адаптивный: канвас по картинке (мин. ширина 1920), параметры — дефолтные
@@ -885,7 +904,8 @@ def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: st
     region_y = max(0, canvas_h - title_bottom - title_size * 2)
     br_r, br_g, br_b = get_average_color(base, 0, region_y, canvas_w, title_size * 2)
     grad_rise = min(canvas_h, title_bottom + title_size * 4)
-    canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), grad_rise)
+    canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), grad_rise,
+                                   dark_level=dark_level)
 
     # заголовок
     draw_centered_title(canvas, title, title_size, COVER_TITLE_LS_FEED, title_bottom)
@@ -907,7 +927,8 @@ def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: st
     return canvas.convert("RGB")
 
 
-def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str, channel: str = "base") -> Image.Image:
+def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str,
+                       channel: str = "base", dark_level: float = 1.0) -> Image.Image:
     cw, ch = STORY_SIZE
     if variant == "ig":
         title_bottom = COVER_TITLE_BOTTOM_IG
@@ -921,7 +942,8 @@ def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str,
     # градиент по яркости в зоне заголовка
     region_y = ch - title_bottom - COVER_TITLE_SIZE_STORY * 2
     br_r, br_g, br_b = get_average_color(base, 0, max(0, region_y), cw, COVER_TITLE_SIZE_STORY * 2)
-    canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), GRAD_RISE_STORY)
+    canvas = apply_bottom_gradient(base, brightness_of(br_r, br_g, br_b), GRAD_RISE_STORY,
+                                   dark_level=dark_level)
 
     # лого сверху по центру:
     #  - канал со своим story-лого → фиксированный размер (story_box), белый как есть
@@ -947,6 +969,14 @@ def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str,
 
 
 # ============ Клавиатуры ============
+_BACK_BTN = InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")
+
+
+def back_keyboard():
+    """Клавиатура из одной кнопки «Назад» — для текстовых шагов (фото/заголовок)."""
+    return InlineKeyboardMarkup([[_BACK_BTN]])
+
+
 def type_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🏷 Брендинг (Тип 1)", callback_data="type:type1")],
@@ -962,6 +992,7 @@ def channel_keyboard():
         [InlineKeyboardButton(CHANNELS["music"]["title"], callback_data="channel:music"),
          InlineKeyboardButton(CHANNELS["agency"]["title"], callback_data="channel:agency")],
         [InlineKeyboardButton(CHANNELS["gastro"]["title"], callback_data="channel:gastro")],
+        [_BACK_BTN],
     ])
 
 
@@ -970,6 +1001,7 @@ def format_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(k, callback_data=f"fmt:{k}") for k in keys[:4]],
         [InlineKeyboardButton(keys[4], callback_data=f"fmt:{keys[4]}")],
+        [_BACK_BTN],
     ])
 
 
@@ -981,7 +1013,26 @@ def hashtag_keyboard():
             rows.append(row); row = []
     if row:
         rows.append(row)
+    rows.append([_BACK_BTN])
     return InlineKeyboardMarkup(rows)
+
+
+def dark_meter(idx: int) -> str:
+    """Текстовый индикатор уровня затемнения: ●●●○○ + подпись ступени."""
+    n = len(DARK_LEVELS)
+    filled = "●" * (idx + 1) + "○" * (n - idx - 1)
+    return f"{filled} ({DARK_LEVEL_NAMES[idx]})"
+
+
+def dark_keyboard(idx: int):
+    """Регулятор затемнения под готовыми обложками. Кнопки гаснут на краях."""
+    left = InlineKeyboardButton(
+        "☀️ Светлее" if idx > 0 else "· · ·",
+        callback_data="dark:down" if idx > 0 else "dark:noop")
+    right = InlineKeyboardButton(
+        "🌑 Темнее" if idx < len(DARK_LEVELS) - 1 else "· · ·",
+        callback_data="dark:up" if idx < len(DARK_LEVELS) - 1 else "dark:noop")
+    return InlineKeyboardMarkup([[left, right]])
 
 
 # ============ Хендлеры ============
@@ -1009,6 +1060,22 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSING_CHANNEL
 
 
+def photos_prompt_text(context) -> str:
+    """Текст шага «пришли фото» — общий для прямого хода и для возврата «Назад»."""
+    channel = context.user_data.get("channel", "base")
+    note = ""
+    if context.user_data.get("mode") != "cover":
+        note = "_(в Тип 1 логотип Ö общий для всех каналов)_\n\n"
+    n = len(context.user_data.get("photos", []))
+    have = f"📂 Уже загружено: *{n}*. " if n else ""
+    return (
+        f"Канал: *{CHANNELS[channel]['title']}*\n\n"
+        f"{note}"
+        "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
+        f"{have}Пришли фото, затем /done"
+    )
+
+
 async def choose_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1016,15 +1083,10 @@ async def choose_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if channel not in CHANNELS:
         channel = "base"
     context.user_data["channel"] = channel
-    note = ""
-    if context.user_data.get("mode") != "cover":
-        note = "_(в Тип 1 логотип Ö общий для всех каналов)_\n\n"
     await query.edit_message_text(
-        f"Канал: *{CHANNELS[channel]['title']}*\n\n"
-        f"{note}"
-        "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
-        "Пришли фото, затем /done",
-        parse_mode="Markdown"
+        photos_prompt_text(context),
+        parse_mode="Markdown",
+        reply_markup=back_keyboard(),
     )
     return WAITING_PHOTOS
 
@@ -1041,6 +1103,10 @@ async def receive_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_PHOTOS
 
 
+TITLE_PROMPT = ("✍️ Пришли *текст заголовка*.\n"
+                "Переносы строк ставь сам — как нужно на обложке.")
+
+
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photos = context.user_data.get("photos", [])
     if not photos:
@@ -1048,9 +1114,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_PHOTOS
     if context.user_data.get("mode") == "cover":
         await update.message.reply_text(
-            "✍️ Пришли *текст заголовка*.\n"
-            "Переносы строк ставь сам — как нужно на обложке.",
-            parse_mode="Markdown"
+            TITLE_PROMPT, parse_mode="Markdown", reply_markup=back_keyboard()
         )
         return WAITING_TITLE
     await update.message.reply_text(
@@ -1080,6 +1144,36 @@ async def choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSING_HASHTAG
 
 
+async def _send_covers(message, photos, title, hashtag, fmt, channel, dark_idx) -> int:
+    """Рендер + отправка обложек (feed/ig/tg) для всех фото на заданном уровне
+    затемнения. Используется и при первой генерации, и при ручной регулировке.
+    Возвращает число успешно обработанных фото."""
+    level = DARK_LEVELS[dark_idx]
+    ok = 0
+    for i, photo_bytes in enumerate(photos):
+        try:
+            img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+            feed = render_cover_feed(img, fmt, title, hashtag, dark_level=level)
+            ig = render_cover_story(img, "ig", title, hashtag, channel=channel, dark_level=level)
+            tg = render_cover_story(img, "tg", title, hashtag, channel=channel, dark_level=level)
+            for result, suffix in ((feed, "feed"), (ig, "ig"), (tg, "tg")):
+                buf = io.BytesIO()
+                result.save(buf, format="JPEG", quality=92)
+                buf.seek(0)
+                await message.reply_document(document=buf, filename=f"cover_{i+1}_{suffix}.jpg")
+            ok += 1
+        except Exception as e:
+            logger.error(f"Ошибка обложки {i+1}: {e}")
+            await message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+    return ok
+
+
+def _dark_control_text(idx: int) -> str:
+    return ("✅ Готово! Текст плохо читается или фон перетемнён?\n"
+            "Подстрой затемнение — перерисую те же кадры 👇\n\n"
+            f"*Затемнение:* {dark_meter(idx)}")
+
+
 async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1091,26 +1185,38 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
 
+    if mode == "cover":
+        title = context.user_data.get("title", "")
+        dark_idx = DARK_DEFAULT_IDX
+        ok = await _send_covers(query.message, photos, title, hashtag, fmt, channel, dark_idx)
+        record_post(channel, mode, ok)
+        if ok:
+            # Держим параметры в user_data, чтобы регулятор затемнения мог
+            # перерисовать те же кадры уже после завершения диалога.
+            context.user_data.clear()
+            context.user_data["cover_session"] = {
+                "photos": photos, "title": title, "hashtag": hashtag,
+                "fmt": fmt, "channel": channel, "dark_idx": dark_idx,
+            }
+            await query.message.reply_text(
+                _dark_control_text(dark_idx), parse_mode="Markdown",
+                reply_markup=dark_keyboard(dark_idx),
+            )
+        else:
+            context.user_data.clear()
+            await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
+        return ConversationHandler.END
+
+    # ---- Тип 1 (брендинг) ----
     ok = 0
     for i, photo_bytes in enumerate(photos):
         try:
             img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            if mode == "cover":
-                title = context.user_data.get("title", "")
-                feed = render_cover_feed(img, fmt, title, hashtag)
-                ig = render_cover_story(img, "ig", title, hashtag, channel=channel)
-                tg = render_cover_story(img, "tg", title, hashtag, channel=channel)
-                for result, suffix in ((feed, "feed"), (ig, "ig"), (tg, "tg")):
-                    buf = io.BytesIO()
-                    result.save(buf, format="JPEG", quality=92)
-                    buf.seek(0)
-                    await query.message.reply_document(document=buf, filename=f"cover_{i+1}_{suffix}.jpg")
-            else:
-                result = process_image(img, fmt, hashtag, channel=channel)
-                buf = io.BytesIO()
-                result.save(buf, format="JPEG", quality=92)
-                buf.seek(0)
-                await query.message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
+            result = process_image(img, fmt, hashtag, channel=channel)
+            buf = io.BytesIO()
+            result.save(buf, format="JPEG", quality=92)
+            buf.seek(0)
+            await query.message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
             ok += 1
         except Exception as e:
             logger.error(f"Ошибка фото {i+1}: {e}")
@@ -1122,10 +1228,90 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def dark_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Топ-левел хендлер регулятора затемнения (работает после конца диалога)."""
+    query = update.callback_query
+    action = query.data.split(":", 1)[1]
+    sess = context.user_data.get("cover_session")
+    if not sess:
+        await query.answer("Сессия устарела — сделай новый пост через /start",
+                           show_alert=True)
+        return
+    if action == "noop":
+        await query.answer()
+        return
+    idx = sess["dark_idx"]
+    step = 1 if action == "up" else -1
+    new_idx = max(0, min(len(DARK_LEVELS) - 1, idx + step))
+    if new_idx == idx:
+        await query.answer("Дальше некуда 🙂")
+        return
+    sess["dark_idx"] = new_idx
+    await query.answer("Перерисовываю…")
+    try:
+        await query.edit_message_text(
+            _dark_control_text(new_idx), parse_mode="Markdown",
+            reply_markup=dark_keyboard(new_idx),
+        )
+    except Exception:
+        pass  # текст не изменился/сообщение устарело — не критично
+    await _send_covers(query.message, sess["photos"], sess["title"], sess["hashtag"],
+                       sess["fmt"], sess["channel"], new_idx)
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Отменено. /start чтобы начать заново.")
     return ConversationHandler.END
+
+
+# ============ Навигация «Назад» ============
+async def back_to_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Что делаем?", reply_markup=type_keyboard())
+    return CHOOSING_TYPE
+
+
+async def back_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    mode = context.user_data.get("mode", "type1")
+    name = "Обложка с текстом" if mode == "cover" else "Брендинг (Тип 1)"
+    await query.edit_message_text(
+        f"Режим: *{name}*\n\nТеперь выбери канал:",
+        parse_mode="Markdown", reply_markup=channel_keyboard())
+    return CHOOSING_CHANNEL
+
+
+async def back_to_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        photos_prompt_text(context), parse_mode="Markdown", reply_markup=back_keyboard())
+    return WAITING_PHOTOS
+
+
+async def back_from_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Из выбора формата назад: в обложке → к заголовку, в Тип 1 → к фото."""
+    query = update.callback_query
+    await query.answer()
+    if context.user_data.get("mode") == "cover":
+        await query.edit_message_text(
+            TITLE_PROMPT, parse_mode="Markdown", reply_markup=back_keyboard())
+        return WAITING_TITLE
+    await query.edit_message_text(
+        photos_prompt_text(context), parse_mode="Markdown", reply_markup=back_keyboard())
+    return WAITING_PHOTOS
+
+
+async def back_to_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    photos = context.user_data.get("photos", [])
+    await query.edit_message_text(
+        f"📐 Выбери формат ({len(photos)} фото):", reply_markup=format_keyboard())
+    return CHOOSING_FORMAT
 
 
 # ============ Рассылка ============
@@ -1357,14 +1543,27 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             CHOOSING_TYPE: [CallbackQueryHandler(choose_type, pattern="^type:")],
-            CHOOSING_CHANNEL: [CallbackQueryHandler(choose_channel, pattern="^channel:")],
+            CHOOSING_CHANNEL: [
+                CallbackQueryHandler(choose_channel, pattern="^channel:"),
+                CallbackQueryHandler(back_to_type, pattern="^nav:back$"),
+            ],
             WAITING_PHOTOS: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photos),
                 CommandHandler("done", done),
+                CallbackQueryHandler(back_to_channel, pattern="^nav:back$"),
             ],
-            WAITING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
-            CHOOSING_FORMAT: [CallbackQueryHandler(choose_format, pattern="^fmt:")],
-            CHOOSING_HASHTAG: [CallbackQueryHandler(choose_hashtag, pattern="^tag:")],
+            WAITING_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title),
+                CallbackQueryHandler(back_to_photos, pattern="^nav:back$"),
+            ],
+            CHOOSING_FORMAT: [
+                CallbackQueryHandler(choose_format, pattern="^fmt:"),
+                CallbackQueryHandler(back_from_format, pattern="^nav:back$"),
+            ],
+            CHOOSING_HASHTAG: [
+                CallbackQueryHandler(choose_hashtag, pattern="^tag:"),
+                CallbackQueryHandler(back_to_format, pattern="^nav:back$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
@@ -1381,6 +1580,9 @@ def main():
     app.add_handler(CommandHandler(SUBSCRIBE_CMD, stats_subscribe))
     app.add_handler(CommandHandler(UNSUBSCRIBE_CMD, stats_unsubscribe))
     app.add_handler(bc_conv)
+    # Регулятор затемнения обложек: топ-левел, до conv, чтобы ловить тапы
+    # уже после завершения диалога. Паттерн не пересекается с conv.
+    app.add_handler(CallbackQueryHandler(dark_adjust, pattern="^dark:"))
     app.add_handler(conv)
 
     logger.info(
