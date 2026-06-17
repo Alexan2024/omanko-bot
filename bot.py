@@ -1080,7 +1080,8 @@ def dark_keyboard(idx: int):
     right = InlineKeyboardButton(
         "🌑 Темнее" if idx < len(DARK_LEVELS) - 1 else "· · ·",
         callback_data="dark:up" if idx < len(DARK_LEVELS) - 1 else "dark:noop")
-    return InlineKeyboardMarkup([[left, right]])
+    done = InlineKeyboardButton("✅ Завершить", callback_data="dark:done")
+    return InlineKeyboardMarkup([[left, right], [done]])
 
 
 # ============ Хендлеры ============
@@ -1280,13 +1281,26 @@ async def dark_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Топ-левел хендлер регулятора затемнения (работает после конца диалога)."""
     query = update.callback_query
     action = query.data.split(":", 1)[1]
+
+    if action == "noop":
+        await query.answer()
+        return
+
+    if action == "done":
+        # Завершаем цикл обложки: гасим кнопки и шлём финальное сообщение.
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        context.user_data.pop("cover_session", None)
+        await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
+        return
+
     sess = context.user_data.get("cover_session")
     if not sess:
         await query.answer("Сессия устарела — сделай новый пост через /start",
                            show_alert=True)
-        return
-    if action == "noop":
-        await query.answer()
         return
     idx = sess["dark_idx"]
     step = 1 if action == "up" else -1
@@ -1296,15 +1310,19 @@ async def dark_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sess["dark_idx"] = new_idx
     await query.answer("Перерисовываю…")
+    # Со старого регулятора снимаем кнопки, чтобы активный регулятор всегда
+    # сидел под самой свежей пачкой кадров, а не висел над ними.
     try:
-        await query.edit_message_text(
-            _dark_control_text(new_idx), parse_mode="Markdown",
-            reply_markup=dark_keyboard(new_idx),
-        )
+        await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
-        pass  # текст не изменился/сообщение устарело — не критично
+        pass  # сообщение устарело — не критично
     await _send_covers(query.message, sess["photos"], sess["title"], sess["hashtag"],
                        sess["fmt"], sess["channel"], new_idx)
+    # Новый регулятор под новыми обложками: снова светлее / темнее / завершить.
+    await query.message.reply_text(
+        _dark_control_text(new_idx), parse_mode="Markdown",
+        reply_markup=dark_keyboard(new_idx),
+    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
