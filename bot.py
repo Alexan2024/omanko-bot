@@ -5,6 +5,7 @@ import asyncio
 import logging
 from datetime import datetime, time as dtime, timezone, timedelta
 from PIL import Image, ImageDraw, ImageFont
+import pillow_avif  # noqa: F401 — регистрирует AVIF-декодер в Pillow
 import numpy as np
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
