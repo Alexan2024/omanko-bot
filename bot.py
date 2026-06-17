@@ -1027,8 +1027,8 @@ def back_keyboard():
 
 def type_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏷 Брендинг (Тип 1)", callback_data="type:type1")],
-        [InlineKeyboardButton("🖼 Обложка с текстом", callback_data="type:cover")],
+        [InlineKeyboardButton("🏷 Брендинг", callback_data="type:type1")],
+        [InlineKeyboardButton("🖼 Обложка", callback_data="type:cover")],
     ])
 
 
@@ -1100,7 +1100,7 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     mode = query.data.split(":", 1)[1]
     context.user_data["mode"] = mode
-    name = "Обложка с текстом" if mode == "cover" else "Брендинг (Тип 1)"
+    name = "Обложка" if mode == "cover" else "Брендинг"
     await query.edit_message_text(
         f"Режим: *{name}*\n\nТеперь выбери канал:",
         parse_mode="Markdown",
@@ -1343,7 +1343,7 @@ async def back_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     mode = context.user_data.get("mode", "type1")
-    name = "Обложка с текстом" if mode == "cover" else "Брендинг (Тип 1)"
+    name = "Обложка" if mode == "cover" else "Брендинг"
     await query.edit_message_text(
         f"Режим: *{name}*\n\nТеперь выбери канал:",
         parse_mode="Markdown", reply_markup=channel_keyboard())
