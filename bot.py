@@ -294,11 +294,56 @@ def _stat_rrect(d, box, r, fill):
     d.rounded_rectangle(box, radius=r, fill=fill)
 
 
+def _stat_draw_bars_legend(d, x0, y, w):
+    """Экспликация для бар-чарта: цветной свотч + название канала.
+    Одна горизонтальная строка по центру; если не влезает по ширине —
+    автоматически переносится на 2 ряда (по 3 элемента)."""
+    font = load_semibold(17)
+    swatch = 14
+    text_gap = 8   # между свотчем и текстом
+    item_gap = 22  # между элементами
+    items = []
+    for key in CHANNELS:
+        title = CHANNELS[key]["title"]
+        try:
+            tw = int(d.textlength(title, font=font))
+        except Exception:
+            tw = len(title) * 10
+        items.append((key, title, tw))
+
+    def _row_width(row):
+        if not row:
+            return 0
+        return (sum(swatch + text_gap + tw for _, _, tw in row)
+                + item_gap * (len(row) - 1))
+
+    if _row_width(items) <= w:
+        rows = [items]
+    else:
+        half = (len(items) + 1) // 2
+        rows = [items[:half], items[half:]]
+
+    row_h = 22
+    for ri, row in enumerate(rows):
+        rw = _row_width(row)
+        cx = x0 + max(0, (w - rw) // 2)
+        ry = y + ri * row_h
+        for key, title, tw in row:
+            color = _STAT_CH_COLORS.get(key, _STAT_INK)
+            _stat_rrect(d, (cx, ry + 2, cx + swatch, ry + swatch + 2), 3, color)
+            d.text((cx + swatch + text_gap, ry - 2), title,
+                   font=font, fill=_STAT_INK)
+            cx += swatch + text_gap + tw + item_gap
+
+
 def _stat_draw_bars(d, x0, y0, w, h, msk_events, until):
     """Stacked-бары: посты по неделям (8 недель) с разбивкой по каналам."""
     d.text((x0, y0), "Посты по неделям", font=load_black(34), fill=_STAT_INK)
     d.text((x0, y0 + 40), "последние 8 недель · по каналам",
            font=load_semibold(19), fill=_STAT_MUTED)
+    # Экспликация: цвет → канал. Без неё юзеру приходилось гадать,
+    # какой бар чему соответствует.
+    _stat_draw_bars_legend(d, x0, y0 + 74, w)
     weeks = 8
     lbl = load_semibold(17)
     buckets = [{k: 0 for k in CHANNELS} for _ in range(weeks)]
@@ -311,7 +356,7 @@ def _stat_draw_bars(d, x0, y0, w, h, msk_events, until):
         buckets[idx][ch] += 1
     totals = [sum(b.values()) for b in buckets]
     maxtot = max(totals) if any(totals) else 1
-    plot_top = y0 + 78
+    plot_top = y0 + 114  # сдвинуто вниз, чтобы освободить место под экспликацию
     plot_bot = y0 + h - 40
     plot_h = plot_bot - plot_top
     for g in range(5):
@@ -389,7 +434,7 @@ def render_stats_card(events, until=None):
     pad = 56
     inner = W - pad * 2
     n_ch = len(CHANNELS)
-    h_bars = 360
+    h_bars = 400  # 360 → 400: +40px на строку легенды над графиком
     h_heat = n_ch * 40 + 130
     gap = 36
     H = pad + h_bars + gap + h_heat + gap + h_heat + pad
