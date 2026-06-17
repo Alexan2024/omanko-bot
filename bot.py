@@ -26,6 +26,7 @@ CHOOSING_FORMAT = 2
 CHOOSING_HASHTAG = 3
 WAITING_TITLE = 4
 CHOOSING_CHANNEL = 5
+WAITING_PARTNER_LOGO = 6
 
 # Состояния рассылки (отдельный диалог, значения не пересекаются с основным)
 BROADCAST_MSG = 100
@@ -481,6 +482,19 @@ HASHTAG_SIZE = 51
 BRIGHTNESS_OFFSET = 45
 ALPHA = 0.95
 
+# ============ Коллаборация — параметры ============
+# Нижняя строка «ÖMANKÖ × партнёр». Координаты в опорных единицах канваса 1920px.
+COLLAB_WORDMARK_W = 327          # полный вордмарк ÖMANKÖ (ширина)
+COLLAB_WORDMARK_H = 71           # высота (нативные пропорции вордмарка: 71/327 ≈ 0.219)
+COLLAB_GAP = 43                  # пропуск между элементами (лого — × — лого)
+COLLAB_X_GLYPH = "×"             # разделитель. Поставь "x", если нужна именно буква
+COLLAB_X_SIZE = HASHTAG_SIZE     # 51 — шрифт/размер как у хештегов в брендинге
+COLLAB_PARTNER_H = 58            # высота лого партнёра (ширина — пропорционально)
+COLLAB_BOTTOM = LOGO_BOTTOM      # 70 — отступ снизу как у брендинга
+COLLAB_WORDMARK_CENTER_DROP = 9  # центр вордмарка для выравнивания — на 9px ниже геометрического
+# Цвет строки: True — адаптивный под фон (как брендинг); False — всегда белый
+COLLAB_ADAPTIVE = True
+
 # ============ Обложка — параметры ============
 # Заголовок (Nunito Sans Black)
 COVER_TITLE_SIZE_FEED = 135      # абсолютный размер на всех соотношениях ленты
@@ -813,6 +827,96 @@ def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str 
     return canvas
 
 
+# ============ Коллаборация — рендер ============
+def process_collab(img: Image.Image, format_key: str, partner_bytes: bytes) -> Image.Image:
+    """КОЛЛАБОРАЦИЯ — нижняя строка «ÖMANKÖ × лого партнёра».
+
+    Слева вордмарк ÖMANKÖ (327×71), пропуск 43px, «×» (шрифт/размер как у
+    хештегов), пропуск 43px, лого партнёра (высота 58px). Группа центрируется
+    по горизонтали; элементы выровнены по общей горизонтальной оси. Низ строки —
+    на том же отступе от края, что и логотип в брендинге (COLLAB_BOTTOM).
+    Все размеры заданы в опорных единицах 1920px и масштабируются под канвас.
+    """
+    fmt = FORMATS[format_key]
+    if fmt is None:
+        if img.width < 1920:
+            up = 1920 / img.width
+            canvas_w = 1920
+            canvas_h = int(img.height * up)
+        else:
+            canvas_w, canvas_h = img.size
+    else:
+        canvas_w, canvas_h = fmt
+
+    scale = canvas_w / 1920
+    canvas = fit_image_to_canvas(img, canvas_w, canvas_h)
+
+    # --- Размеры элементов в пикселях канваса ---
+    wm_w = max(1, int(COLLAB_WORDMARK_W * scale))
+    wm_h = max(1, int(COLLAB_WORDMARK_H * scale))
+    gap = int(COLLAB_GAP * scale)
+    x_size = max(1, int(COLLAB_X_SIZE * scale))
+    partner_h = max(1, int(COLLAB_PARTNER_H * scale))
+    bottom = int(COLLAB_BOTTOM * scale)
+    center_drop = COLLAB_WORDMARK_CENTER_DROP * scale
+
+    # --- Лого партнёра: масштаб по высоте 58px (ширина пропорционально) ---
+    partner = Image.open(io.BytesIO(partner_bytes)).convert("RGBA")
+    partner_w = max(1, round(partner.width * (partner_h / partner.height)))
+    partner_rs = partner.resize((partner_w, partner_h), Image.LANCZOS)
+
+    # --- Вордмарк ÖMANKÖ ---
+    wm_rs = get_wordmark().resize((wm_w, wm_h), Image.LANCZOS)
+
+    # --- Габариты глифа «×» ---
+    font = load_semibold(x_size)
+    _probe = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
+    xbbox = _probe.textbbox((0, 0), COLLAB_X_GLYPH, font=font)
+    x_w = xbbox[2] - xbbox[0]
+    x_h = xbbox[3] - xbbox[1]
+
+    # --- Горизонталь: вся группа по центру канваса ---
+    group_w = wm_w + gap + x_w + gap + partner_w
+    group_left = (canvas_w - group_w) // 2
+
+    # --- Вертикаль: низ вордмарка на `bottom` от низа канваса ---
+    wm_top = canvas_h - bottom - wm_h
+    # Ось выравнивания = геометрический центр вордмарка + сдвиг вниз на 9px
+    center_y = wm_top + wm_h / 2 + center_drop
+
+    # --- Адаптивный цвет по фону под всей строкой ---
+    if COLLAB_ADAPTIVE:
+        strip_top = int(min(wm_top, center_y - x_h / 2, center_y - partner_h / 2))
+        strip_bottom = int(max(wm_top + wm_h, center_y + x_h / 2, center_y + partner_h / 2))
+        sr, sg, sb = get_average_color(canvas, group_left, strip_top,
+                                       group_w, max(1, strip_bottom - strip_top))
+        percent = BRIGHTNESS_OFFSET if brightness_of(sr, sg, sb) < 128 else -BRIGHTNESS_OFFSET
+        color = adjust_brightness(sr, sg, sb, percent)
+    else:
+        color = (255, 255, 255)
+
+    overlay = canvas.convert("RGBA")
+
+    # 1) Вордмарк ÖMANKÖ
+    overlay.alpha_composite(_tint_white_logo(wm_rs, color, ALPHA), (group_left, wm_top))
+
+    # 2) «×» — центр глифа на оси center_y
+    x_left = group_left + wm_w + gap
+    draw = ImageDraw.Draw(overlay)
+    fill = (color[0], color[1], color[2], int(255 * ALPHA))
+    x_tx = int(x_left - xbbox[0])
+    x_ty = int(center_y - x_h / 2 - xbbox[1])
+    draw.text((x_tx, x_ty), COLLAB_X_GLYPH, font=font, fill=fill)
+
+    # 3) Лого партнёра — высота 58px, центр по center_y
+    partner_left = x_left + x_w + gap
+    partner_top = int(center_y - partner_h / 2)
+    overlay.alpha_composite(_tint_white_logo(partner_rs, color, ALPHA),
+                            (partner_left, partner_top))
+
+    return overlay.convert("RGB")
+
+
 # ============ Обложка: примитивы ============
 def paste_wordmark(canvas_rgba: Image.Image, target_w: int, cx: int, y_top: int):
     wm = get_wordmark()
@@ -1029,6 +1133,7 @@ def type_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🏷 Брендинг", callback_data="type:type1")],
         [InlineKeyboardButton("🖼 Обложка", callback_data="type:cover")],
+        [InlineKeyboardButton("🤝 Коллаборация", callback_data="type:collab")],
     ])
 
 
@@ -1100,6 +1205,17 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     mode = query.data.split(":", 1)[1]
     context.user_data["mode"] = mode
+    if mode == "collab":
+        context.user_data["channel"] = "base"  # коллаб всегда на базовом вордмарке
+        await query.edit_message_text(
+            "Режим: *Коллаборация* 🤝\n\n"
+            "Сначала пришли *логотип партнёра*:\n"
+            "PNG, белый, без фона. Отправляй как *файл* (скрепка → Файл), "
+            "чтобы не потерять прозрачность.",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard(),
+        )
+        return WAITING_PARTNER_LOGO
     name = "Обложка" if mode == "cover" else "Брендинг"
     await query.edit_message_text(
         f"Режим: *{name}*\n\nТеперь выбери канал:",
@@ -1111,18 +1227,57 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def photos_prompt_text(context) -> str:
     """Текст шага «пришли фото» — общий для прямого хода и для возврата «Назад»."""
-    channel = context.user_data.get("channel", "base")
-    note = ""
-    if context.user_data.get("mode") != "cover":
-        note = "_(в Тип 1 логотип Ö общий для всех каналов)_\n\n"
+    mode = context.user_data.get("mode")
     n = len(context.user_data.get("photos", []))
     have = f"📂 Уже загружено: *{n}*. " if n else ""
+    if mode == "collab":
+        return (
+            "🤝 *Коллаборация* — логотип партнёра принят.\n\n"
+            "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
+            f"{have}Пришли фото, затем /done"
+        )
+    channel = context.user_data.get("channel", "base")
+    note = ""
+    if mode != "cover":
+        note = "_(в Тип 1 логотип Ö общий для всех каналов)_\n\n"
     return (
         f"Канал: *{CHANNELS[channel]['title']}*\n\n"
         f"{note}"
         "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
         f"{have}Пришли фото, затем /done"
     )
+
+
+async def receive_partner_logo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Коллаборация: приём белого PNG-логотипа партнёра (как файл или фото)."""
+    data = None
+    doc = update.message.document
+    if doc and (doc.mime_type or "").startswith("image/"):
+        file = await doc.get_file()
+        data = bytes(await file.download_as_bytearray())
+    elif update.message.photo:
+        file = await update.message.photo[-1].get_file()
+        data = bytes(await file.download_as_bytearray())
+
+    if not data:
+        await update.message.reply_text(
+            "Это не похоже на картинку 🙃 Пришли *PNG* логотипа партнёра "
+            "(лучше как файл, чтобы сохранить прозрачность).",
+            parse_mode="Markdown", reply_markup=back_keyboard())
+        return WAITING_PARTNER_LOGO
+    try:
+        Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception:
+        await update.message.reply_text(
+            "Не смог открыть это как изображение. Пришли PNG ещё раз.",
+            reply_markup=back_keyboard())
+        return WAITING_PARTNER_LOGO
+
+    context.user_data["partner_logo"] = data
+    await update.message.reply_text(
+        photos_prompt_text(context),
+        parse_mode="Markdown", reply_markup=back_keyboard())
+    return WAITING_PHOTOS
 
 
 async def choose_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1189,8 +1344,46 @@ async def choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["format"] = query.data.split(":", 1)[1]
+    if context.user_data.get("mode") == "collab":
+        return await generate_collab(update, context)
     await query.edit_message_text("Выбери хештег:", reply_markup=hashtag_keyboard())
     return CHOOSING_HASHTAG
+
+
+async def generate_collab(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Коллаборация: рендер всех фото с нижней строкой «ÖMANKÖ × партнёр».
+    Хештегов нет — генерим сразу после выбора формата."""
+    query = update.callback_query
+    fmt = context.user_data.get("format", "4:5")
+    photos = context.user_data.get("photos", [])
+    partner = context.user_data.get("partner_logo")
+
+    await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
+
+    if not partner:
+        await query.message.reply_text(
+            "Потерялся логотип партнёра 😅 Начни заново через /start.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    ok = 0
+    for i, photo_bytes in enumerate(photos):
+        try:
+            img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+            result = process_collab(img, fmt, partner)
+            buf = io.BytesIO()
+            result.save(buf, format="JPEG", quality=92)
+            buf.seek(0)
+            await query.message.reply_document(document=buf, filename=f"collab_{i+1}.jpg")
+            ok += 1
+        except Exception as e:
+            logger.error(f"Ошибка коллаб-фото {i+1}: {e}")
+            await query.message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+
+    record_post(context.user_data.get("channel", "base"), "collab", ok)
+    context.user_data.clear()
+    await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
+    return ConversationHandler.END
 
 
 async def _send_covers(message, photos, title, hashtag, fmt, channel, dark_idx) -> int:
@@ -1343,6 +1536,13 @@ async def back_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     mode = context.user_data.get("mode", "type1")
+    if mode == "collab":
+        await query.edit_message_text(
+            "Режим: *Коллаборация* 🤝\n\n"
+            "Пришли *логотип партнёра*: PNG, белый, без фона "
+            "(лучше как файл).",
+            parse_mode="Markdown", reply_markup=back_keyboard())
+        return WAITING_PARTNER_LOGO
     name = "Обложка" if mode == "cover" else "Брендинг"
     await query.edit_message_text(
         f"Режим: *{name}*\n\nТеперь выбери канал:",
@@ -1611,6 +1811,10 @@ def main():
             CHOOSING_TYPE: [CallbackQueryHandler(choose_type, pattern="^type:")],
             CHOOSING_CHANNEL: [
                 CallbackQueryHandler(choose_channel, pattern="^channel:"),
+                CallbackQueryHandler(back_to_type, pattern="^nav:back$"),
+            ],
+            WAITING_PARTNER_LOGO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_partner_logo),
                 CallbackQueryHandler(back_to_type, pattern="^nav:back$"),
             ],
             WAITING_PHOTOS: [
