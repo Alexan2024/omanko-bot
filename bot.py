@@ -25,7 +25,6 @@ CHOOSING_FORMAT = 2
 CHOOSING_HASHTAG = 3
 WAITING_TITLE = 4
 CHOOSING_CHANNEL = 5
-WAITING_CUSTOM_HASHTAG = 6
 
 # Состояния рассылки (отдельный диалог, значения не пересекаются с основным)
 BROADCAST_MSG = 100
@@ -37,6 +36,13 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 # ID администратора (только он может слать рассылку). Берётся из переменной
 # окружения ADMIN_ID в Railway. Свой ID можно узнать командой /myid.
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
+
+# Скрытые команды подписки на еженедельный отчёт. Нигде в меню не светятся —
+# раздаёшь их вручную тем, кому нужен доступ. Можно переименовать через
+# переменные окружения в Railway (Telegram-команды: латиница/цифры/нижнее
+# подчёркивание). Если секрет «утёк» — просто поменяй имя команды.
+SUBSCRIBE_CMD = os.environ.get("STATS_SUBSCRIBE_CMD", "stats_on")
+UNSUBSCRIBE_CMD = os.environ.get("STATS_UNSUBSCRIBE_CMD", "stats_off")
 
 
 def _resolve_data_dir():
@@ -60,6 +66,7 @@ def _resolve_data_dir():
 DATA_DIR, STORAGE_PERSISTENT = _resolve_data_dir()
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+SUBS_FILE = os.path.join(DATA_DIR, "stats_subs.json")
 
 
 def load_users() -> set:
@@ -100,9 +107,28 @@ def remove_users(ids) -> None:
 # дата (UTC, ISO), канал, режим (type1/cover), сколько фото реально обработано.
 
 MSK = timezone(timedelta(hours=3))  # Москва — UTC+3, без переходов на летнее
+REPORT_HOUR_MSK = 19  # час отправки еженедельного отчёта по пятницам (МСК)
 _STATS_CAP = 5000  # держим файл в узде: храним последние N событий
 _RU_MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
               "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+def load_subscribers() -> set:
+    try:
+        with open(SUBS_FILE, "r", encoding="utf-8") as f:
+            return set(int(x) for x in json.load(f))
+    except Exception:
+        return set()
+
+
+def save_subscribers(subs) -> None:
+    try:
+        tmp = SUBS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(subs), f)
+        os.replace(tmp, SUBS_FILE)
+    except Exception as e:
+        logger.error(f"Не смог сохранить подписчиков статистики: {e}")
 
 
 def load_stats() -> list:
@@ -209,7 +235,7 @@ def build_weekly_report(events, until=None) -> str:
     lines += [
         "",
         "*По типам (фото):*",
-        f"🏷 Брендинг — {type1_photos}",
+        f"🏷 Тип 1 — {type1_photos}",
         f"🖼 Обложка — {cover_photos}",
     ]
     return "\n".join(lines)
@@ -222,25 +248,12 @@ FORMATS = {
     "Адаптивный": None,
 }
 
-# Кнопка «без хештега» (значение-метка, проверяется в рендере) и метка «свой хештег»
-NO_HASHTAG = "— Без хештега —"
-CUSTOM_HASHTAG_CB = "__custom__"
-
-# Общий набор тегов для всех каналов
-COMMON_HASHTAGS = [
-    "#art", "#archives", "#community", "#item", "#paper",
-    "#space", "#style", "#cinema", "#architecture", "#cars",
+HASHTAGS = [
+    "— Без хештега —",
+    "#architecture", "#cars", "#cinema", "#archives",
+    "#art", "#community", "#item", "#music",
+    "#paper", "#space", "#style", "#beauty", "#fashion", "#agency"
 ]
-
-# Хештеги по каналам: общий набор, гастро дополнительно расширен
-CHANNEL_HASHTAGS = {
-    "base":   COMMON_HASHTAGS,
-    "news":   COMMON_HASHTAGS,
-    "beauty": COMMON_HASHTAGS,
-    "music":  COMMON_HASHTAGS,
-    "agency": COMMON_HASHTAGS,
-    "gastro": COMMON_HASHTAGS + ["#books", "#recommendation", "#interior", "#movies"],
-}
 
 # ============ Тип 1 (брендинг) — БЕЗ ИЗМЕНЕНИЙ ============
 LOGO_W = 56
@@ -767,8 +780,8 @@ def render_cover_story(img: Image.Image, variant: str, title: str, hashtag: str,
 # ============ Клавиатуры ============
 def type_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏷 Брендинг", callback_data="type:type1")],
-        [InlineKeyboardButton("🖼 Обложка", callback_data="type:cover")],
+        [InlineKeyboardButton("🏷 Брендинг (Тип 1)", callback_data="type:type1")],
+        [InlineKeyboardButton("🖼 Обложка с текстом", callback_data="type:cover")],
     ])
 
 
@@ -791,18 +804,14 @@ def format_keyboard():
     ])
 
 
-def hashtag_keyboard(channel: str = "base"):
-    tags = CHANNEL_HASHTAGS.get(channel, COMMON_HASHTAGS)
-    items = [NO_HASHTAG] + tags
+def hashtag_keyboard():
     rows, row = [], []
-    for tag in items:
+    for tag in HASHTAGS:
         row.append(InlineKeyboardButton(tag, callback_data=f"tag:{tag}"))
         if len(row) == 2:
             rows.append(row); row = []
     if row:
         rows.append(row)
-    # «Свой хештег» — отдельной строкой на всю ширину, для всех каналов
-    rows.append([InlineKeyboardButton("✏️ Свой хештег", callback_data=f"tag:{CUSTOM_HASHTAG_CB}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -822,7 +831,7 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     mode = query.data.split(":", 1)[1]
     context.user_data["mode"] = mode
-    name = "Обложка" if mode == "cover" else "Брендинг"
+    name = "Обложка с текстом" if mode == "cover" else "Брендинг (Тип 1)"
     await query.edit_message_text(
         f"Режим: *{name}*\n\nТеперь выбери канал:",
         parse_mode="Markdown",
@@ -898,17 +907,20 @@ async def choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["format"] = query.data.split(":", 1)[1]
-    channel = context.user_data.get("channel", "base")
-    await query.edit_message_text("Выбери хештег:", reply_markup=hashtag_keyboard(channel))
+    await query.edit_message_text("Выбери хештег:", reply_markup=hashtag_keyboard())
     return CHOOSING_HASHTAG
 
 
-async def _process_and_send(context: ContextTypes.DEFAULT_TYPE, message, hashtag: str):
-    """Общий рендер для обоих путей выбора хештега (кнопка / свой текст)."""
+async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    hashtag = query.data.split(":", 1)[1]
     fmt = context.user_data.get("format", "4:5")
     photos = context.user_data.get("photos", [])
     mode = context.user_data.get("mode", "type1")
     channel = context.user_data.get("channel", "base")
+
+    await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
 
     ok = 0
     for i, photo_bytes in enumerate(photos):
@@ -923,54 +935,21 @@ async def _process_and_send(context: ContextTypes.DEFAULT_TYPE, message, hashtag
                     buf = io.BytesIO()
                     result.save(buf, format="JPEG", quality=92)
                     buf.seek(0)
-                    await message.reply_document(document=buf, filename=f"cover_{i+1}_{suffix}.jpg")
+                    await query.message.reply_document(document=buf, filename=f"cover_{i+1}_{suffix}.jpg")
             else:
                 result = process_image(img, fmt, hashtag, channel=channel)
                 buf = io.BytesIO()
                 result.save(buf, format="JPEG", quality=92)
                 buf.seek(0)
-                await message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
+                await query.message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
             ok += 1
         except Exception as e:
             logger.error(f"Ошибка фото {i+1}: {e}")
-            await message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+            await query.message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
 
     record_post(channel, mode, ok)
     context.user_data.clear()
-    await message.reply_text("✅ Готово! /start чтобы начать заново.")
-
-
-async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    tag = query.data.split(":", 1)[1]
-
-    # Свой хештег — уходим в ввод текста, рендер будет после
-    if tag == CUSTOM_HASHTAG_CB:
-        await query.edit_message_text(
-            "✍️ Кидай свой хештег одним словом 🔥\n"
-            "Можно с # или без — решётку добавлю сам. Например: лето"
-        )
-        return WAITING_CUSTOM_HASHTAG
-
-    photos = context.user_data.get("photos", [])
-    await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
-    await _process_and_send(context, query.message, tag)
-    return ConversationHandler.END
-
-
-async def receive_custom_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = (update.message.text or "").strip()
-    token = raw.split()[0] if raw.split() else ""
-    token = token.lstrip("#").strip()
-    if not token:
-        await update.message.reply_text("Пустой хештег — пришли ещё раз, например: лето")
-        return WAITING_CUSTOM_HASHTAG
-    hashtag = "#" + token
-
-    photos = context.user_data.get("photos", [])
-    await update.message.reply_text(f"⚙️ Обрабатываю {len(photos)} фото с {hashtag}...")
-    await _process_and_send(context, update.message, hashtag)
+    await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
     return ConversationHandler.END
 
 
@@ -1074,25 +1053,95 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def weekly_stats_job(context: ContextTypes.DEFAULT_TYPE):
-    """Раз в день срабатывает в 21:00 МСК; шлём отчёт только по пятницам."""
+    """Раз в день срабатывает в REPORT_HOUR_MSK:00 МСК; шлём отчёт только по
+    пятницам — админу и всем подписчикам. Заблокировавших бот убираем из
+    подписки (админа не трогаем)."""
     now = datetime.now(MSK)
     if now.weekday() != 4:  # 4 = пятница (Пн=0 … Вс=6)
         return
-    if ADMIN_ID == 0:
-        logger.warning("Еженедельный отчёт: ADMIN_ID не задан — некому слать.")
+    recipients = load_subscribers()
+    if ADMIN_ID != 0:
+        recipients.add(ADMIN_ID)
+    if not recipients:
+        logger.info("Еженедельный отчёт: ни подписчиков, ни ADMIN_ID — пропускаю.")
         return
+
     report = build_weekly_report(load_stats(), until=now)
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=report, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Не смог отправить еженедельный отчёт: {e}")
+    dead = []
+    for target in list(recipients):
+        try:
+            await context.bot.send_message(chat_id=target, text=report, parse_mode="Markdown")
+        except Forbidden:
+            dead.append(target)
+        except RetryAfter as e:
+            await asyncio.sleep(int(e.retry_after) + 1)
+            try:
+                await context.bot.send_message(chat_id=target, text=report, parse_mode="Markdown")
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Еженедельный отчёт для {target}: {e}")
+        await asyncio.sleep(0.05)  # бережём лимиты Telegram
+
+    if dead:
+        subs = load_subscribers()
+        subs -= set(dead)
+        save_subscribers(subs)
+        logger.info(f"Еженедельный отчёт: убрал заблокировавших из подписки: {len(dead)}.")
+
+
+def _stats_allowed(uid: int, chat_id: int) -> bool:
+    """Кому доступна статистика: пока ADMIN_ID не задан — всем (для настройки),
+    затем — админу и подписчикам скрытой команды."""
+    if ADMIN_ID == 0:
+        return True
+    if uid == ADMIN_ID:
+        return True
+    return chat_id in load_subscribers()
+
+
+async def stats_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скрытая команда подписки. Кто её знает — тот подписывается на пятничный
+    отчёт и получает доступ к /stats."""
+    chat_id = update.effective_chat.id
+    subs = load_subscribers()
+    if chat_id in subs:
+        await update.message.reply_text(
+            f"📊 Ты уже в деле — сводка прилетает по пятницам в "
+            f"{REPORT_HOUR_MSK}:00 МСК. И /stats тоже твоя 😎"
+        )
+        return
+    subs.add(chat_id)
+    save_subscribers(subs)
+    await update.message.reply_text(
+        "📊 *Подписка оформлена!*\n\n"
+        f"Каждую пятницу в *{REPORT_HOUR_MSK}:00 МСК* тебе будет прилетать "
+        "сводка по ÖMANKÖ — сколько постов и фото сделано за неделю.\n\n"
+        "Бонусом открыл доступ к /stats — зови в любой момент 🔥\n\n"
+        f"Передумаешь — /{UNSUBSCRIBE_CMD}",
+        parse_mode="Markdown"
+    )
+
+
+async def stats_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отписка от еженедельного отчёта (и от доступа к /stats)."""
+    chat_id = update.effective_chat.id
+    subs = load_subscribers()
+    if chat_id not in subs:
+        return  # тихо — команда скрытая, незнакомцам реагировать незачем
+    subs.discard(chat_id)
+    save_subscribers(subs)
+    await update.message.reply_text(
+        f"Отписал от еженедельной сводки. Захочешь обратно — /{SUBSCRIBE_CMD} 👋"
+    )
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика по запросу (за последние 7 дней) + состояние хранилища.
-    Пока ADMIN_ID не задан — отвечает всем, потом только админу."""
+    Доступна админу и подписчикам; для остальных команды как будто нет."""
     uid = update.effective_user.id
-    if ADMIN_ID != 0 and uid != ADMIN_ID:
+    chat_id = update.effective_chat.id
+    if not _stats_allowed(uid, chat_id):
         return
     report = build_weekly_report(load_stats())
     storage = ("🟢 постоянное (Railway Volume) — переживёт деплой"
@@ -1124,7 +1173,6 @@ def main():
             WAITING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
             CHOOSING_FORMAT: [CallbackQueryHandler(choose_format, pattern="^fmt:")],
             CHOOSING_HASHTAG: [CallbackQueryHandler(choose_hashtag, pattern="^tag:")],
-            WAITING_CUSTOM_HASHTAG: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_hashtag)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
@@ -1138,6 +1186,8 @@ def main():
     )
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler(SUBSCRIBE_CMD, stats_subscribe))
+    app.add_handler(CommandHandler(UNSUBSCRIBE_CMD, stats_unsubscribe))
     app.add_handler(bc_conv)
     app.add_handler(conv)
 
@@ -1148,9 +1198,9 @@ def main():
     if app.job_queue:
         app.job_queue.run_daily(
             weekly_stats_job,
-            time=dtime(hour=21, minute=0, tzinfo=MSK),
+            time=dtime(hour=REPORT_HOUR_MSK, minute=0, tzinfo=MSK),
         )
-        logger.info("Еженедельный отчёт: запланирован на пятницу 21:00 МСК.")
+        logger.info(f"Еженедельный отчёт: запланирован на пятницу {REPORT_HOUR_MSK}:00 МСК.")
     else:
         logger.warning(
             "JobQueue недоступна — еженедельный отчёт не запустится. "
