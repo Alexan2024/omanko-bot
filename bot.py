@@ -27,6 +27,7 @@ CHOOSING_HASHTAG = 3
 WAITING_TITLE = 4
 CHOOSING_CHANNEL = 5
 WAITING_PARTNER_LOGO = 6
+WAITING_CUSTOM_HASHTAG = 7
 
 # Состояния рассылки (отдельный диалог, значения не пересекаются с основным)
 BROADCAST_MSG = 100
@@ -464,12 +465,26 @@ FORMATS = {
     "Адаптивный": None,
 }
 
-HASHTAGS = [
-    "— Без хештега —",
-    "#architecture", "#cars", "#cinema", "#archives",
-    "#art", "#community", "#item", "#music",
-    "#paper", "#space", "#style", "#beauty", "#fashion", "#agency"
+# Кнопка «без хештега» (значение-метка, проверяется в рендере) и метка «свой хештег»
+NO_HASHTAG = "— Без хештега —"
+CUSTOM_HASHTAG_CB = "__custom__"
+
+# Общий набор тегов для всех каналов
+COMMON_HASHTAGS = [
+    "#art", "#archives", "#community", "#item", "#paper",
+    "#space", "#style", "#cinema", "#architecture", "#cars",
 ]
+
+# Хештеги по каналам: общий набор, у гастро — общий + четыре своих.
+# Править теги в одном месте: общий — в COMMON_HASHTAGS, гастро-специфику — в его строке.
+CHANNEL_HASHTAGS = {
+    "base":   COMMON_HASHTAGS,
+    "news":   COMMON_HASHTAGS,
+    "beauty": COMMON_HASHTAGS,
+    "music":  COMMON_HASHTAGS,
+    "agency": COMMON_HASHTAGS,
+    "gastro": COMMON_HASHTAGS + ["#books", "#recommendation", "#interior", "#movies"],
+}
 
 # ============ Тип 1 (брендинг) — БЕЗ ИЗМЕНЕНИЙ ============
 LOGO_W = 56
@@ -1158,14 +1173,18 @@ def format_keyboard():
     ])
 
 
-def hashtag_keyboard():
+def hashtag_keyboard(channel: str = "base"):
+    tags = CHANNEL_HASHTAGS.get(channel, COMMON_HASHTAGS)
+    items = [NO_HASHTAG] + tags
     rows, row = [], []
-    for tag in HASHTAGS:
+    for tag in items:
         row.append(InlineKeyboardButton(tag, callback_data=f"tag:{tag}"))
         if len(row) == 2:
             rows.append(row); row = []
     if row:
         rows.append(row)
+    # «Свой хештег» — отдельной строкой на всю ширину, для всех каналов
+    rows.append([InlineKeyboardButton("✏️ Свой хештег", callback_data=f"tag:{CUSTOM_HASHTAG_CB}")])
     rows.append([_BACK_BTN])
     return InlineKeyboardMarkup(rows)
 
@@ -1346,7 +1365,8 @@ async def choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["format"] = query.data.split(":", 1)[1]
     if context.user_data.get("mode") == "collab":
         return await generate_collab(update, context)
-    await query.edit_message_text("Выбери хештег:", reply_markup=hashtag_keyboard())
+    channel = context.user_data.get("channel", "base")
+    await query.edit_message_text("Выбери хештег:", reply_markup=hashtag_keyboard(channel))
     return CHOOSING_HASHTAG
 
 
@@ -1416,21 +1436,18 @@ def _dark_control_text(idx: int) -> str:
             f"*Затемнение:* {dark_meter(idx)}")
 
 
-async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    hashtag = query.data.split(":", 1)[1]
+async def _render_with_hashtag(message, context: ContextTypes.DEFAULT_TYPE, hashtag: str):
+    """Общий рендер для обоих путей выбора хештега (кнопка из списка / свой текст).
+    Сообщение со статусом «Обрабатываю…» каждый путь шлёт сам — здесь только рендер."""
     fmt = context.user_data.get("format", "4:5")
     photos = context.user_data.get("photos", [])
     mode = context.user_data.get("mode", "type1")
     channel = context.user_data.get("channel", "base")
 
-    await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
-
     if mode == "cover":
         title = context.user_data.get("title", "")
         dark_idx = DARK_DEFAULT_IDX
-        ok = await _send_covers(query.message, photos, title, hashtag, fmt, channel, dark_idx)
+        ok = await _send_covers(message, photos, title, hashtag, fmt, channel, dark_idx)
         record_post(channel, mode, ok)
         if ok:
             # Держим параметры в user_data, чтобы регулятор затемнения мог
@@ -1440,13 +1457,13 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "photos": photos, "title": title, "hashtag": hashtag,
                 "fmt": fmt, "channel": channel, "dark_idx": dark_idx,
             }
-            await query.message.reply_text(
+            await message.reply_text(
                 _dark_control_text(dark_idx), parse_mode="Markdown",
                 reply_markup=dark_keyboard(dark_idx),
             )
         else:
             context.user_data.clear()
-            await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
+            await message.reply_text("✅ Готово! /start чтобы начать заново.")
         return ConversationHandler.END
 
     # ---- Тип 1 (брендинг) ----
@@ -1458,16 +1475,48 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buf = io.BytesIO()
             result.save(buf, format="JPEG", quality=92)
             buf.seek(0)
-            await query.message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
+            await message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
             ok += 1
         except Exception as e:
             logger.error(f"Ошибка фото {i+1}: {e}")
-            await query.message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+            await message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
 
     record_post(channel, mode, ok)
     context.user_data.clear()
-    await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
+    await message.reply_text("✅ Готово! /start чтобы начать заново.")
     return ConversationHandler.END
+
+
+async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tag = query.data.split(":", 1)[1]
+
+    # Свой хештег — уводим в ввод текста, рендер будет после ввода
+    if tag == CUSTOM_HASHTAG_CB:
+        await query.edit_message_text(
+            "✍️ Кидай свой хештег одним словом 🔥\n"
+            "Можно с # или без — решётку добавлю сам. Например: лето"
+        )
+        return WAITING_CUSTOM_HASHTAG
+
+    photos = context.user_data.get("photos", [])
+    await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
+    return await _render_with_hashtag(query.message, context, tag)
+
+
+async def receive_custom_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip()
+    token = raw.split()[0] if raw.split() else ""
+    token = token.lstrip("#").strip()
+    if not token:
+        await update.message.reply_text("Пустой хештег — пришли ещё раз, например: лето")
+        return WAITING_CUSTOM_HASHTAG
+    hashtag = "#" + token
+
+    photos = context.user_data.get("photos", [])
+    await update.message.reply_text(f"⚙️ Обрабатываю {len(photos)} фото с {hashtag}...")
+    return await _render_with_hashtag(update.message, context, hashtag)
 
 
 async def dark_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1832,6 +1881,10 @@ def main():
             ],
             CHOOSING_HASHTAG: [
                 CallbackQueryHandler(choose_hashtag, pattern="^tag:"),
+                CallbackQueryHandler(back_to_format, pattern="^nav:back$"),
+            ],
+            WAITING_CUSTOM_HASHTAG: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_hashtag),
                 CallbackQueryHandler(back_to_format, pattern="^nav:back$"),
             ],
         },
