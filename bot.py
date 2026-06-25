@@ -31,6 +31,7 @@ WAITING_CUSTOM_HASHTAG = 7
 WAITING_STORE_TEXT = 8
 CHOOSING_STORE_COLOR = 9
 STORE_COLOR_SLIDER = 10
+COVER_DARK_SLIDER = 11
 
 # Состояния рассылки (отдельный диалог, значения не пересекаются с основным)
 BROADCAST_MSG = 100
@@ -638,6 +639,7 @@ CHANNELS = {
 }
 
 BASE_WORDMARK_FILE = "wordmark_white.png"  # широкий ÖMANKÖ: лента + база сторис
+BASE_O_LOGO_FILE = "main_o.png"            # угловой логотип Ö (брендинг базы/agency + стор)
 
 # Кэши: базовый вордмарк и логотипы каналов (грузим с диска один раз)
 _WORDMARK_CACHE = {}
@@ -794,10 +796,22 @@ def paste_story_channel_logo(canvas_rgba, fname, cx, y_top, w, h):
     return True
 
 
-# ============ Тип 1: логотип Ö (без изменений) ============
+# ============ Тип 1: логотип Ö ============
 def draw_logo(canvas: Image.Image, x: int, y: int, w: int, h: int, color: tuple):
-    logo = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(logo)
+    """Угловой логотип Ö. Берётся из PNG (main_o.png) — белый силуэт на
+    прозрачном фоне, адаптивно перекрашивается под фон тем же цветом, что и
+    раньше (как лого остальных каналов). Размеры/отступы/цвет не меняются.
+    Если PNG не найден — векторный фолбэк (прежнее поведение)."""
+    logo = _load_logo(BASE_O_LOGO_FILE)
+    if logo is not None:
+        resized = logo.resize((w, h), Image.LANCZOS)
+        tinted = _tint_white_logo(resized, color, ALPHA)
+        canvas.alpha_composite(tinted, (x, y))
+        return
+
+    # --- фолбэк: векторный Ö (прежнее поведение, если файла нет) ---
+    vlogo = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(vlogo)
     r, g, b = color
     a = int(255 * ALPHA)
     fill = (r, g, b, a)
@@ -809,7 +823,7 @@ def draw_logo(canvas: Image.Image, x: int, y: int, w: int, h: int, color: tuple)
     d.ellipse(inner, fill=(0, 0, 0, 0))
     d.ellipse([int(79 * sx), int(0 * sy), int(164 * sx), int(85 * sy)], fill=fill)
     d.ellipse([int(201 * sx), int(0 * sy), int(286 * sx), int(85 * sy)], fill=fill)
-    canvas.paste(logo, (x, y), logo)
+    canvas.paste(vlogo, (x, y), vlogo)
 
 
 def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str = "base") -> Image.Image:
@@ -1248,16 +1262,18 @@ def dark_meter(idx: int) -> str:
     return f"{filled} ({DARK_LEVEL_NAMES[idx]})"
 
 
-def dark_keyboard(idx: int):
-    """Регулятор затемнения под готовыми обложками. Кнопки гаснут на краях."""
+def cover_dark_keyboard(idx: int):
+    """Слайдер затемнения градиента обложки (с живым превью).
+    ☀️ Светлее / 🌑 Темнее — двигают уровень; ✅ Сгенерировать — финальный рендер.
+    Края гаснут. Префикс cdark: не пересекается с другими хендлерами."""
     left = InlineKeyboardButton(
         "☀️ Светлее" if idx > 0 else "· · ·",
-        callback_data="dark:down" if idx > 0 else "dark:noop")
+        callback_data="cdark:down" if idx > 0 else "cdark:noop")
     right = InlineKeyboardButton(
         "🌑 Темнее" if idx < len(DARK_LEVELS) - 1 else "· · ·",
-        callback_data="dark:up" if idx < len(DARK_LEVELS) - 1 else "dark:noop")
-    done = InlineKeyboardButton("✅ Завершить", callback_data="dark:done")
-    return InlineKeyboardMarkup([[left, right], [done]])
+        callback_data="cdark:up" if idx < len(DARK_LEVELS) - 1 else "cdark:noop")
+    apply = InlineKeyboardButton("✅ Сгенерировать", callback_data="cdark:apply")
+    return InlineKeyboardMarkup([[left, right], [apply], [_BACK_BTN]])
 
 
 # ---- STORE: выбор цвета графики ----
@@ -1755,10 +1771,24 @@ async def _send_covers(message, photos, title, hashtag, fmt, channel, dark_idx) 
     return ok
 
 
-def _dark_control_text(idx: int) -> str:
-    return ("✅ Готово! Текст плохо читается или фон перетемнён?\n"
-            "Подстрой затемнение — перерисую те же кадры 👇\n\n"
-            f"*Затемнение:* {dark_meter(idx)}")
+def _render_cover_preview(context: ContextTypes.DEFAULT_TYPE, idx: int) -> bytes:
+    """Превью обложки (лента, первое фото) на текущем уровне затемнения —
+    уменьшенное, для скорости. По нему пользователь подбирает плотность."""
+    sess = context.user_data["cover_session"]
+    img = Image.open(io.BytesIO(sess["photos"][0])).convert("RGB")
+    res = render_cover_feed(img, sess["fmt"], sess["title"], sess["hashtag"],
+                            dark_level=DARK_LEVELS[idx])
+    res.thumbnail((1200, 1500), Image.LANCZOS)
+    buf = io.BytesIO()
+    res.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _cover_slider_caption(idx: int) -> str:
+    return ("🎚 Затемнение градиента — подбери под кадр.\n"
+            "Превью на первом фото 👇\n\n"
+            f"*Уровень:* {dark_meter(idx)}")
 
 
 async def _render_with_hashtag(message, context: ContextTypes.DEFAULT_TYPE, hashtag: str):
@@ -1771,25 +1801,18 @@ async def _render_with_hashtag(message, context: ContextTypes.DEFAULT_TYPE, hash
 
     if mode == "cover":
         title = context.user_data.get("title", "")
-        dark_idx = DARK_DEFAULT_IDX
-        ok = await _send_covers(message, photos, title, hashtag, fmt, channel, dark_idx)
-        record_post(channel, mode, ok)
-        if ok:
-            # Держим параметры в user_data, чтобы регулятор затемнения мог
-            # перерисовать те же кадры уже после завершения диалога.
-            context.user_data.clear()
-            context.user_data["cover_session"] = {
-                "photos": photos, "title": title, "hashtag": hashtag,
-                "fmt": fmt, "channel": channel, "dark_idx": dark_idx,
-            }
-            await message.reply_text(
-                _dark_control_text(dark_idx), parse_mode="Markdown",
-                reply_markup=dark_keyboard(dark_idx),
-            )
-        else:
-            context.user_data.clear()
-            await message.reply_text("✅ Готово! /start чтобы начать заново.")
-        return ConversationHandler.END
+        idx = DARK_DEFAULT_IDX
+        # Не генерируем сразу: сначала слайдер затемнения с живым превью.
+        # Параметры держим в сессии — по ним рисуем превью и финальный рендер.
+        context.user_data["cover_session"] = {
+            "photos": photos, "title": title, "hashtag": hashtag,
+            "fmt": fmt, "channel": channel, "dark_idx": idx,
+        }
+        preview = _render_cover_preview(context, idx)
+        await message.reply_photo(
+            photo=io.BytesIO(preview), caption=_cover_slider_caption(idx),
+            parse_mode="Markdown", reply_markup=cover_dark_keyboard(idx))
+        return COVER_DARK_SLIDER
 
     # ---- Тип 1 (брендинг) ----
     ok = 0
@@ -1844,52 +1867,68 @@ async def receive_custom_hashtag(update: Update, context: ContextTypes.DEFAULT_T
     return await _render_with_hashtag(update.message, context, hashtag)
 
 
-async def dark_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Топ-левел хендлер регулятора затемнения (работает после конца диалога)."""
+async def cover_dark_slider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Слайдер затемнения обложки с превью. Двигает уровень и перерисовывает
+    превью на первом фото; по ✅ Сгенерировать — финальный рендер всех кадров
+    (лента + IG + TG) на выбранном уровне затемнения."""
     query = update.callback_query
     action = query.data.split(":", 1)[1]
-
-    if action == "noop":
-        await query.answer()
-        return
-
-    if action == "done":
-        # Завершаем цикл обложки: гасим кнопки и шлём финальное сообщение.
-        await query.answer()
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        context.user_data.pop("cover_session", None)
-        await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
-        return
 
     sess = context.user_data.get("cover_session")
     if not sess:
         await query.answer("Сессия устарела — сделай новый пост через /start",
                            show_alert=True)
-        return
+        return COVER_DARK_SLIDER
+
+    if action == "noop":
+        await query.answer()
+        return COVER_DARK_SLIDER
+
+    if action == "apply":
+        idx = sess["dark_idx"]
+        await query.answer("Генерирую…")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("⚙️ Рендерю обложки и сторис...")
+        ok = await _send_covers(query.message, sess["photos"], sess["title"],
+                                sess["hashtag"], sess["fmt"], sess["channel"], idx)
+        record_post(sess["channel"], "cover", ok)
+        context.user_data.clear()
+        await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
+        return ConversationHandler.END
+
     idx = sess["dark_idx"]
-    step = 1 if action == "up" else -1
-    new_idx = max(0, min(len(DARK_LEVELS) - 1, idx + step))
+    new_idx = max(0, min(len(DARK_LEVELS) - 1, idx + (1 if action == "up" else -1)))
     if new_idx == idx:
         await query.answer("Дальше некуда 🙂")
-        return
+        return COVER_DARK_SLIDER
     sess["dark_idx"] = new_idx
-    await query.answer("Перерисовываю…")
-    # Со старого регулятора снимаем кнопки, чтобы активный регулятор всегда
-    # сидел под самой свежей пачкой кадров, а не висел над ними.
+    await query.answer()
+    preview = _render_cover_preview(context, new_idx)
     try:
-        await query.edit_message_reply_markup(reply_markup=None)
+        await query.edit_message_media(
+            InputMediaPhoto(media=io.BytesIO(preview),
+                            caption=_cover_slider_caption(new_idx), parse_mode="Markdown"),
+            reply_markup=cover_dark_keyboard(new_idx))
+    except Exception as e:
+        logger.error(f"COVER слайдер: не смог обновить превью: {e}")
+    return COVER_DARK_SLIDER
+
+
+async def back_cover_slider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Назад со слайдера затемнения → к выбору хештега."""
+    query = update.callback_query
+    await query.answer()
+    channel = context.user_data.get("channel", "base")
+    try:
+        await query.message.delete()
     except Exception:
-        pass  # сообщение устарело — не критично
-    await _send_covers(query.message, sess["photos"], sess["title"], sess["hashtag"],
-                       sess["fmt"], sess["channel"], new_idx)
-    # Новый регулятор под новыми обложками: снова светлее / темнее / завершить.
+        pass
     await query.message.reply_text(
-        _dark_control_text(new_idx), parse_mode="Markdown",
-        reply_markup=dark_keyboard(new_idx),
-    )
+        "Выбери хештег:", reply_markup=hashtag_keyboard(channel))
+    return CHOOSING_HASHTAG
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2227,6 +2266,10 @@ def main():
                 CallbackQueryHandler(store_gray_slider, pattern="^sgray:"),
                 CallbackQueryHandler(back_store_slider_to_color, pattern="^nav:back$"),
             ],
+            COVER_DARK_SLIDER: [
+                CallbackQueryHandler(cover_dark_slider, pattern="^cdark:"),
+                CallbackQueryHandler(back_cover_slider, pattern="^nav:back$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
@@ -2243,9 +2286,6 @@ def main():
     app.add_handler(CommandHandler(SUBSCRIBE_CMD, stats_subscribe))
     app.add_handler(CommandHandler(UNSUBSCRIBE_CMD, stats_unsubscribe))
     app.add_handler(bc_conv)
-    # Регулятор затемнения обложек: топ-левел, до conv, чтобы ловить тапы
-    # уже после завершения диалога. Паттерн не пересекается с conv.
-    app.add_handler(CallbackQueryHandler(dark_adjust, pattern="^dark:"))
     app.add_handler(conv)
 
     logger.info(
