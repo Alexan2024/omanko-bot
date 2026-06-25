@@ -593,7 +593,7 @@ STORE_LOGO_LEFT = 95            # отступ лого слева
 STORE_LOGO_BOTTOM = 76          # отступ лого снизу
 STORE_TEXT_GAP = 20            # отступ текста от правого края лого
 STORE_TEXT_SIZE = 15.62        # кегль подписи (Nunito Bold)
-STORE_TEXT_BOTTOM = 88          # низ нижней строки от низа холста
+STORE_TEXT_BOTTOM = 86          # низ нижней строки от низа холста
 STORE_LINE_HEIGHT = 0.9        # межстрочный интервал = 90% кегля
 
 # Цвет графики STORE: None — адаптивный (как в брендинге), либо фикс. (r,g,b).
