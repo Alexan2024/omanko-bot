@@ -7,7 +7,7 @@ from datetime import datetime, time as dtime, timezone, timedelta
 from PIL import Image, ImageDraw, ImageFont
 import pillow_avif  # noqa: F401 — регистрирует AVIF-декодер в Pillow
 import numpy as np
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
@@ -28,6 +28,9 @@ WAITING_TITLE = 4
 CHOOSING_CHANNEL = 5
 WAITING_PARTNER_LOGO = 6
 WAITING_CUSTOM_HASHTAG = 7
+WAITING_STORE_TEXT = 8
+CHOOSING_STORE_COLOR = 9
+STORE_COLOR_SLIDER = 10
 
 # Состояния рассылки (отдельный диалог, значения не пересекаются с основным)
 BROADCAST_MSG = 100
@@ -160,7 +163,7 @@ def record_post(channel: str, mode: str, n_photos: int) -> None:
     events.append({
         "ts": datetime.now(timezone.utc).isoformat(),
         "channel": channel,
-        "mode": mode if mode in ("type1", "cover") else "type1",
+        "mode": mode if mode in ("type1", "cover", "store") else "type1",
         "photos": int(n_photos),
     })
     if len(events) > _STATS_CAP:
@@ -191,6 +194,7 @@ def build_weekly_report(events, until=None) -> str:
 
     chans = {k: {"posts": 0, "photos": 0} for k in CHANNELS}
     total_posts = total_photos = type1_photos = cover_photos = 0
+    store_photos = 0
 
     for e in events:
         try:
@@ -212,6 +216,8 @@ def build_weekly_report(events, until=None) -> str:
         total_photos += ph
         if e.get("mode") == "cover":
             cover_photos += ph
+        elif e.get("mode") == "store":
+            store_photos += ph
         else:
             type1_photos += ph
 
@@ -240,6 +246,7 @@ def build_weekly_report(events, until=None) -> str:
         "*По типам (фото):*",
         f"🏷 Тип 1 — {type1_photos}",
         f"🖼 Обложка — {cover_photos}",
+        f"🛍 STORE — {store_photos}",
     ]
     return "\n".join(lines)
 
@@ -574,6 +581,28 @@ COVER_FORMATS = {
 # Адаптивный режим обложки использует параметры 4:5
 COVER_DEFAULT = dict(bubble_h=126, bubble_top=68, title_bottom=365)
 
+# ============ ÖMANKÖ STORE ============
+# Витрина магазина: фикс. вертикаль 2000×2500, фон-фото (cover-fit),
+# угловой Ö (адаптивный цвет, как в брендинге) + подпись в 2 строки тем же
+# цветом. Шрифт Nunito BOLD (не Sans), мелкий. Все значения — абсолютные px
+# на холсте 2000×2500.
+STORE_SIZE = (2000, 2500)
+STORE_LOGO_W = 59
+STORE_LOGO_H = 74
+STORE_LOGO_LEFT = 95            # отступ лого слева
+STORE_LOGO_BOTTOM = 76          # отступ лого снизу
+STORE_TEXT_GAP = 20            # отступ текста от правого края лого
+STORE_TEXT_SIZE = 15.62        # кегль подписи (Nunito Bold)
+STORE_TEXT_BOTTOM = 90          # низ нижней строки от низа холста
+STORE_LINE_HEIGHT = 0.9        # межстрочный интервал = 90% кегля
+
+# Цвет графики STORE: None — адаптивный (как в брендинге), либо фикс. (r,g,b).
+STORE_COLOR_LIGHT = (0xE4, 0xE4, 0xE5)   # светлый пресет #E4E4E5
+STORE_COLOR_DARK = (0x68, 0x68, 0x68)    # тёмный пресет  #686868
+# ЧБ-слайдер: позиции 0..STORE_GRAY_STEPS, белый (255) → чёрный (0).
+STORE_GRAY_STEPS = 14
+STORE_GRAY_DEFAULT_IDX = 7
+
 # ============ Каналы сетки ============
 # У каждого канала ДВА варианта лого (белые PNG, прозрачный фон):
 #   type1_logo  — для режима «Тип 1» (угловой логотип внизу слева)
@@ -700,6 +729,28 @@ def load_black(size: int) -> ImageFont.FreeTypeFont:
             if os.path.exists(sf):
                 return ImageFont.truetype(sf, size)
         return ImageFont.load_default(size=size)
+
+
+def load_bold(size) -> ImageFont.FreeTypeFont:
+    """Nunito BOLD через вариативный шрифт (ось Weight → Bold/700).
+    Это настоящий Nunito Bold, не Sans. Размер принимает float."""
+    path = os.path.join(BASE, "Nunito-VariableFont_wght.ttf")
+    try:
+        f = ImageFont.truetype(path, size)
+        try:
+            f.set_variation_by_name(b"Bold")
+        except Exception as e:
+            logger.warning(f"Nunito Bold-вариация не выставилась ({e}) — вес по умолчанию")
+        return f
+    except Exception as e:
+        logger.error(f"Nunito variable не найден ({e}) — фолбэк SemiBold/системный")
+        try:
+            return ImageFont.truetype(os.path.join(BASE, "Nunito-SemiBold.ttf"), size)
+        except Exception:
+            for sf in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",):
+                if os.path.exists(sf):
+                    return ImageFont.truetype(sf, size)
+            return ImageFont.load_default(size=int(size))
 
 
 def get_wordmark() -> Image.Image:
@@ -1149,6 +1200,7 @@ def type_keyboard():
         [InlineKeyboardButton("🏷 Брендинг", callback_data="type:type1")],
         [InlineKeyboardButton("🖼 Обложка", callback_data="type:cover")],
         [InlineKeyboardButton("🤝 Коллаборация", callback_data="type:collab")],
+        [InlineKeyboardButton("🛍 ÖMANKÖ STORE", callback_data="type:store")],
     ])
 
 
@@ -1208,6 +1260,90 @@ def dark_keyboard(idx: int):
     return InlineKeyboardMarkup([[left, right], [done]])
 
 
+# ---- STORE: выбор цвета графики ----
+def _store_gray_value(idx: int):
+    """Позиция слайдера → серый (v,v,v). idx 0 = белый (255), max = чёрный (0)."""
+    idx = max(0, min(STORE_GRAY_STEPS, idx))
+    v = round(255 * (STORE_GRAY_STEPS - idx) / STORE_GRAY_STEPS)
+    return (v, v, v)
+
+
+def _store_gray_hex(idx: int) -> str:
+    v = _store_gray_value(idx)[0]
+    return "#{0:02X}{0:02X}{0:02X}".format(v)
+
+
+def _store_gray_meter(idx: int) -> str:
+    cells = "".join("🔘" if i == idx else "▬" for i in range(STORE_GRAY_STEPS + 1))
+    return f"⚪ {cells} ⚫"
+
+
+def store_color_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 Адаптивный", callback_data="scol:adaptive")],
+        [InlineKeyboardButton("⬜ Светлый", callback_data="scol:light"),
+         InlineKeyboardButton("⬛ Тёмный", callback_data="scol:dark")],
+        [InlineKeyboardButton("🎚 Свой оттенок (ЧБ)", callback_data="scol:custom")],
+        [_BACK_BTN],
+    ])
+
+
+def store_gray_keyboard(idx: int):
+    """ЧБ-слайдер: ◀️ светлее / hex / темнее ▶️. Края гаснут."""
+    left = InlineKeyboardButton(
+        "◀️ светлее" if idx > 0 else "· · ·",
+        callback_data="sgray:down" if idx > 0 else "sgray:noop")
+    mid = InlineKeyboardButton(_store_gray_hex(idx), callback_data="sgray:noop")
+    right = InlineKeyboardButton(
+        "темнее ▶️" if idx < STORE_GRAY_STEPS else "· · ·",
+        callback_data="sgray:up" if idx < STORE_GRAY_STEPS else "sgray:noop")
+    return InlineKeyboardMarkup([
+        [left, mid, right],
+        [InlineKeyboardButton("✅ Применить ко всем", callback_data="sgray:apply")],
+        [_BACK_BTN],
+    ])
+
+
+def process_store(img: Image.Image, text: str, color=None) -> Image.Image:
+    """ÖMANKÖ STORE — витрина магазина.
+    Холст всегда 2000×2500, фон-фото (cover-fit). Векторный Ö внизу слева;
+    справа — подпись в 2 строки тем же цветом, шрифт Nunito Bold, межстрочный 90%.
+    color=None → адаптивный цвет под фоном (как в брендинге);
+    color=(r,g,b) → фиксированный цвет графики (Ö + текст)."""
+    cw, ch = STORE_SIZE
+    canvas = fit_image_to_canvas(img, cw, ch)
+
+    logo_x = STORE_LOGO_LEFT
+    logo_y = ch - STORE_LOGO_BOTTOM - STORE_LOGO_H
+    logo_w, logo_h = STORE_LOGO_W, STORE_LOGO_H
+
+    if color is None:
+        # Адаптивный цвет под лого (как в брендинге) — общий для Ö и текста
+        r, g, b = get_average_color(canvas, logo_x, logo_y, logo_w, logo_h)
+        percent = BRIGHTNESS_OFFSET if brightness_of(r, g, b) < 128 else -BRIGHTNESS_OFFSET
+        color = adjust_brightness(r, g, b, percent)
+    color = (int(color[0]), int(color[1]), int(color[2]))
+
+    canvas_rgba = canvas.convert("RGBA")
+    draw_logo(canvas_rgba, logo_x, logo_y, logo_w, logo_h, color)
+
+    # Подпись: до 2 строк справа от лого, тем же цветом
+    lines = text.split("\n")[:2]
+    font = load_bold(STORE_TEXT_SIZE)
+    draw = ImageDraw.Draw(canvas_rgba)
+    text_x = logo_x + logo_w + STORE_TEXT_GAP
+    line_h = STORE_TEXT_SIZE * STORE_LINE_HEIGHT
+    fill = (color[0], color[1], color[2], int(255 * ALPHA))
+    _, descent = font.getmetrics()
+    base_last = ch - STORE_TEXT_BOTTOM - descent  # базовая линия нижней строки
+    n = len(lines)
+    for i, line in enumerate(lines):
+        baseline = base_last - (n - 1 - i) * line_h
+        draw.text((text_x, baseline), line, font=font, fill=fill, anchor="ls")
+
+    return canvas_rgba.convert("RGB")
+
+
 # ============ Хендлеры ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_user(update.effective_chat.id)
@@ -1235,6 +1371,14 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(),
         )
         return WAITING_PARTNER_LOGO
+    if mode == "store":
+        context.user_data["channel"] = "base"  # Ö всегда базовый векторный
+        await query.edit_message_text(
+            photos_prompt_text(context),
+            parse_mode="Markdown",
+            reply_markup=back_keyboard(),
+        )
+        return WAITING_PHOTOS
     name = "Обложка" if mode == "cover" else "Брендинг"
     await query.edit_message_text(
         f"Режим: *{name}*\n\nТеперь выбери канал:",
@@ -1252,6 +1396,12 @@ def photos_prompt_text(context) -> str:
     if mode == "collab":
         return (
             "🤝 *Коллаборация* — логотип партнёра принят.\n\n"
+            "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
+            f"{have}Пришли фото, затем /done"
+        )
+    if mode == "store":
+        return (
+            "🛍 *ÖMANKÖ STORE*\n\n"
             "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
             f"{have}Пришли фото, затем /done"
         )
@@ -1329,6 +1479,9 @@ async def receive_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 TITLE_PROMPT = ("✍️ Пришли *текст заголовка*.\n"
                 "Переносы строк ставь сам — как нужно на обложке.")
 
+STORE_TEXT_PROMPT = ("✍️ Пришли *текст подписи* для STORE — 2 строки.\n"
+                     "Перенос между строками ставь сам (Enter).")
+
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photos = context.user_data.get("photos", [])
@@ -1340,6 +1493,11 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             TITLE_PROMPT, parse_mode="Markdown", reply_markup=back_keyboard()
         )
         return WAITING_TITLE
+    if context.user_data.get("mode") == "store":
+        await update.message.reply_text(
+            STORE_TEXT_PROMPT, parse_mode="Markdown", reply_markup=back_keyboard()
+        )
+        return WAITING_STORE_TEXT
     await update.message.reply_text(
         f"📐 Выбери формат ({len(photos)} фото):", reply_markup=format_keyboard()
     )
@@ -1403,6 +1561,173 @@ async def generate_collab(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_post(context.user_data.get("channel", "base"), "collab", ok)
     context.user_data.clear()
     await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
+    return ConversationHandler.END
+
+
+async def receive_store_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """STORE: приём подписи (до 2 строк) → переход к выбору цвета графики."""
+    text = (update.message.text or "").strip("\n")
+    if not text.strip():
+        await update.message.reply_text(
+            "Текст пустой — пришли подпись ещё раз (2 строки).",
+            reply_markup=back_keyboard())
+        return WAITING_STORE_TEXT
+    context.user_data["store_text"] = text
+    await update.message.reply_text(
+        "🎨 *Цвет графики* (логотип + текст):",
+        parse_mode="Markdown", reply_markup=store_color_keyboard())
+    return CHOOSING_STORE_COLOR
+
+
+def _render_store_preview(context: ContextTypes.DEFAULT_TYPE, idx: int) -> bytes:
+    """Превью первого фото на текущем оттенке слайдера (уменьшенное, для скорости)."""
+    photos = context.user_data.get("photos", [])
+    text = context.user_data.get("store_text", "")
+    img = Image.open(io.BytesIO(photos[0])).convert("RGB")
+    res = process_store(img, text, color=_store_gray_value(idx))
+    res.thumbnail((1200, 1500), Image.LANCZOS)
+    buf = io.BytesIO()
+    res.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _store_slider_caption(idx: int) -> str:
+    return (f"🎚 Оттенок графики (ЧБ)\n{_store_gray_meter(idx)}\n"
+            f"`{_store_gray_hex(idx)}`")
+
+
+async def choose_store_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice in ("adaptive", "light", "dark"):
+        context.user_data["store_color"] = {
+            "adaptive": None,
+            "light": STORE_COLOR_LIGHT,
+            "dark": STORE_COLOR_DARK,
+        }[choice]
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("⚙️ Обрабатываю фото...")
+        return await generate_store(query.message, context)
+
+    # custom → ЧБ-слайдер с живым превью
+    idx = STORE_GRAY_DEFAULT_IDX
+    context.user_data["store_gray_idx"] = idx
+    preview = _render_store_preview(context, idx)
+    if query.message.photo:
+        await query.edit_message_media(
+            InputMediaPhoto(media=io.BytesIO(preview),
+                            caption=_store_slider_caption(idx), parse_mode="Markdown"),
+            reply_markup=store_gray_keyboard(idx))
+    else:
+        await query.message.reply_photo(
+            photo=io.BytesIO(preview), caption=_store_slider_caption(idx),
+            parse_mode="Markdown", reply_markup=store_gray_keyboard(idx))
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    return STORE_COLOR_SLIDER
+
+
+async def store_gray_slider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data.split(":", 1)[1]
+
+    if action == "noop":
+        await query.answer()
+        return STORE_COLOR_SLIDER
+
+    if action == "apply":
+        idx = context.user_data.get("store_gray_idx", STORE_GRAY_DEFAULT_IDX)
+        context.user_data["store_color"] = _store_gray_value(idx)
+        await query.answer("Применяю…")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("⚙️ Обрабатываю фото...")
+        return await generate_store(query.message, context)
+
+    idx = context.user_data.get("store_gray_idx", STORE_GRAY_DEFAULT_IDX)
+    new_idx = max(0, min(STORE_GRAY_STEPS, idx + (1 if action == "up" else -1)))
+    if new_idx == idx:
+        await query.answer("Дальше некуда 🙂")
+        return STORE_COLOR_SLIDER
+    context.user_data["store_gray_idx"] = new_idx
+    await query.answer()
+    preview = _render_store_preview(context, new_idx)
+    try:
+        await query.edit_message_media(
+            InputMediaPhoto(media=io.BytesIO(preview),
+                            caption=_store_slider_caption(new_idx), parse_mode="Markdown"),
+            reply_markup=store_gray_keyboard(new_idx))
+    except Exception as e:
+        logger.error(f"STORE слайдер: не смог обновить превью: {e}")
+    return STORE_COLOR_SLIDER
+
+
+async def back_store_color_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.message.photo:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.message.reply_text(
+            STORE_TEXT_PROMPT, parse_mode="Markdown", reply_markup=back_keyboard())
+    else:
+        await query.edit_message_text(
+            STORE_TEXT_PROMPT, parse_mode="Markdown", reply_markup=back_keyboard())
+    return WAITING_STORE_TEXT
+
+
+async def back_store_slider_to_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.edit_message_caption(
+            caption="🎨 *Цвет графики* (логотип + текст):",
+            parse_mode="Markdown", reply_markup=store_color_keyboard())
+    except Exception:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.message.reply_text(
+            "🎨 *Цвет графики* (логотип + текст):",
+            parse_mode="Markdown", reply_markup=store_color_keyboard())
+    return CHOOSING_STORE_COLOR
+
+
+async def generate_store(message, context: ContextTypes.DEFAULT_TYPE):
+    """STORE: рендер всех фото в формат витрины 2000×2500 и отправка файлами."""
+    photos = context.user_data.get("photos", [])
+    text = context.user_data.get("store_text", "")
+    color = context.user_data.get("store_color")  # None=адаптивный или (r,g,b)
+    ok = 0
+    for i, photo_bytes in enumerate(photos):
+        try:
+            img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+            result = process_store(img, text, color=color)
+            buf = io.BytesIO()
+            result.save(buf, format="JPEG", quality=92)
+            buf.seek(0)
+            await message.reply_document(document=buf, filename=f"store_{i+1}.jpg")
+            ok += 1
+        except Exception as e:
+            logger.error(f"Ошибка стор-фото {i+1}: {e}")
+            await message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+
+    record_post(context.user_data.get("channel", "base"), "store", ok)
+    context.user_data.clear()
+    await message.reply_text("✅ Готово! /start чтобы начать заново.")
     return ConversationHandler.END
 
 
@@ -1592,6 +1917,9 @@ async def back_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "(лучше как файл).",
             parse_mode="Markdown", reply_markup=back_keyboard())
         return WAITING_PARTNER_LOGO
+    if mode == "store":
+        await query.edit_message_text("Что делаем?", reply_markup=type_keyboard())
+        return CHOOSING_TYPE
     name = "Обложка" if mode == "cover" else "Брендинг"
     await query.edit_message_text(
         f"Режим: *{name}*\n\nТеперь выбери канал:",
@@ -1886,6 +2214,18 @@ def main():
             WAITING_CUSTOM_HASHTAG: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_hashtag),
                 CallbackQueryHandler(back_to_format, pattern="^nav:back$"),
+            ],
+            WAITING_STORE_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_store_text),
+                CallbackQueryHandler(back_to_photos, pattern="^nav:back$"),
+            ],
+            CHOOSING_STORE_COLOR: [
+                CallbackQueryHandler(choose_store_color, pattern="^scol:"),
+                CallbackQueryHandler(back_store_color_to_text, pattern="^nav:back$"),
+            ],
+            STORE_COLOR_SLIDER: [
+                CallbackQueryHandler(store_gray_slider, pattern="^sgray:"),
+                CallbackQueryHandler(back_store_slider_to_color, pattern="^nav:back$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
