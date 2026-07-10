@@ -480,7 +480,7 @@ CUSTOM_HASHTAG_CB = "__custom__"
 # Общий набор тегов для всех каналов
 COMMON_HASHTAGS = [
     "#art", "#archives", "#community", "#item", "#paper",
-    "#space", "#style", "#cinema", "#architecture", "#cars",
+    "#space", "#style", "#cinema", "#architecture", "#cars", "#fashion"
 ]
 
 # Хештеги по каналам: общий набор, у гастро — общий + четыре своих.
