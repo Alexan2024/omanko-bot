@@ -491,7 +491,7 @@ CHANNEL_HASHTAGS = {
     "beauty": COMMON_HASHTAGS,
     "music":  COMMON_HASHTAGS,
     "agency": COMMON_HASHTAGS,
-    "gastro": COMMON_HASHTAGS + ["#books", "#recommendation", "#interior", "#movies"],
+    "gastro": COMMON_HASHTAGS + ["#books", "#recommendation", "#interior", "#movies", "#moscow"],
 }
 
 # ============ Тип 1 (брендинг) — БЕЗ ИЗМЕНЕНИЙ ============
