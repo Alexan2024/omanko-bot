@@ -36,7 +36,12 @@ logs/
 *.tmp
 temp/
 tmp/
-*.json
+
+# Данные бота: пишутся в корень репо, когда Railway Volume не подключён.
+# Содержат реальные chat_id редакторов — коммитить нельзя.
+/users.json
+/stats.json
+/stats_subs.json
 
 # Claude Harness
 .claude
