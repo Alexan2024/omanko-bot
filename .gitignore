@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+__pycache
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+ENV/
+env/
+
+# IDE specific files
+.idea/
+.vscode/
+
+# Environment variables
+.env
+
+# Logs if any are created locally
+*.log
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Application logs and temporary files
+logs_kube/
+logs/
+*.log
+*.tmp
+temp/
+tmp/
+*.json
+
+# Claude Harness
+.claude
+obsidian/
