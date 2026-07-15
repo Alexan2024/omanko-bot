@@ -43,6 +43,9 @@ tmp/
 /stats.json
 /stats_subs.json
 
+# Вывод упавших эталонных тестов — для разглядывания глазами, не для git
+tests/output/
+
 # Claude Harness
 .claude
 obsidian/
