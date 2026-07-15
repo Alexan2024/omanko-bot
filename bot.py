@@ -17,63 +17,16 @@ from telegram.error import Forbidden, RetryAfter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("BOT_TOKEN")
-
-# ============ Состояния диалога ============
-CHOOSING_TYPE = 0
-WAITING_PHOTOS = 1
-CHOOSING_FORMAT = 2
-CHOOSING_HASHTAG = 3
-WAITING_TITLE = 4
-CHOOSING_CHANNEL = 5
-WAITING_PARTNER_LOGO = 6
-WAITING_CUSTOM_HASHTAG = 7
-WAITING_STORE_TEXT = 8
-CHOOSING_STORE_COLOR = 9
-STORE_COLOR_SLIDER = 10
-COVER_DARK_SLIDER = 11
-
-# Состояния рассылки (отдельный диалог, значения не пересекаются с основным)
-BROADCAST_MSG = 100
-BROADCAST_CONFIRM = 101
-
-BASE = os.path.dirname(os.path.abspath(__file__))
-
-# ============ Рассылка: админ и хранилище пользователей ============
-# ID администратора (только он может слать рассылку). Берётся из переменной
-# окружения ADMIN_ID в Railway. Свой ID можно узнать командой /myid.
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
-
-# Скрытые команды подписки на еженедельный отчёт. Нигде в меню не светятся —
-# раздаёшь их вручную тем, кому нужен доступ. Можно переименовать через
-# переменные окружения в Railway (Telegram-команды: латиница/цифры/нижнее
-# подчёркивание). Если секрет «утёк» — просто поменяй имя команды.
-SUBSCRIBE_CMD = os.environ.get("STATS_SUBSCRIBE_CMD", "stats_on")
-UNSUBSCRIBE_CMD = os.environ.get("STATS_UNSUBSCRIBE_CMD", "stats_off")
-
-
-def _resolve_data_dir():
-    """Где хранить users.json и stats.json так, чтобы пережило передеплой.
-    Railway сам выставляет RAILWAY_VOLUME_MOUNT_PATH, когда к сервису подключён
-    Volume — это самый надёжный признак постоянного хранилища. Если его нет,
-    пробуем /data (на случай ручного монтирования), иначе пишем рядом с ботом —
-    но это эфемерно: при следующем деплое всё обнулится.
-    Возвращает (папка, постоянное_ли)."""
-    vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
-    candidates = ([(vol, True)] if vol else []) + [("/data", False), (BASE, False)]
-    for d, persistent in candidates:
-        try:
-            if os.path.isdir(d) and os.access(d, os.W_OK):
-                return d, persistent
-        except Exception:
-            pass
-    return BASE, False
-
-
-DATA_DIR, STORAGE_PERSISTENT = _resolve_data_dir()
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-STATS_FILE = os.path.join(DATA_DIR, "stats.json")
-SUBS_FILE = os.path.join(DATA_DIR, "stats_subs.json")
+from omanko.paths import (
+    BASE, DATA_DIR, STORAGE_PERSISTENT, USERS_FILE, STATS_FILE, SUBS_FILE,
+)
+from omanko.settings import TOKEN, ADMIN_ID, SUBSCRIBE_CMD, UNSUBSCRIBE_CMD
+from omanko.states import (
+    CHOOSING_TYPE, WAITING_PHOTOS, CHOOSING_FORMAT, CHOOSING_HASHTAG,
+    WAITING_TITLE, CHOOSING_CHANNEL, WAITING_PARTNER_LOGO,
+    WAITING_CUSTOM_HASHTAG, WAITING_STORE_TEXT, CHOOSING_STORE_COLOR,
+    STORE_COLOR_SLIDER, COVER_DARK_SLIDER, BROADCAST_MSG, BROADCAST_CONFIRM,
+)
 
 
 def load_users() -> set:
