@@ -13,5 +13,6 @@ COPY NunitoSans-Black.ttf .
 COPY Nunito-VariableFont_wght.ttf .
 COPY *.png ./
 COPY bot.py .
+COPY omanko/ ./omanko/
 
 CMD ["python", "bot.py"]

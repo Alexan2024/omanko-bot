@@ -1,0 +1,51 @@
+# macOS
+.DS_Store
+__pycache
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+ENV/
+env/
+
+# IDE specific files
+.idea/
+.vscode/
+
+# Environment variables
+.env
+
+# Logs if any are created locally
+*.log
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Application logs and temporary files
+logs_kube/
+logs/
+*.log
+*.tmp
+temp/
+tmp/
+
+# Данные бота: пишутся в корень репо, когда Railway Volume не подключён.
+# Содержат реальные chat_id редакторов — коммитить нельзя.
+/users.json
+/stats.json
+/stats_subs.json
+
+# Вывод упавших эталонных тестов — для разглядывания глазами, не для git
+tests/output/
+
+# Claude Harness
+.claude
+obsidian/
