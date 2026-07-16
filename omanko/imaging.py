@@ -8,6 +8,7 @@ import logging
 import os
 
 import numpy as np
+import pillow_avif  # noqa: F401 — регистрирует AVIF-декодер в Pillow
 from PIL import Image, ImageDraw, ImageFont
 
 from omanko.config import ALPHA, BASE_O_LOGO_FILE, BASE_WORDMARK_FILE
