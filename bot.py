@@ -266,6 +266,7 @@ _STAT_CH_COLORS = {
     "music":  (255, 176, 60),
     "agency": (60, 214, 180),
     "gastro": (255, 96, 96),
+    "dom":    (168, 130, 255),
 }
 _STAT_BG = (18, 20, 25)
 _STAT_CARD = (24, 27, 33)
@@ -492,6 +493,7 @@ CHANNEL_HASHTAGS = {
     "music":  COMMON_HASHTAGS,
     "agency": COMMON_HASHTAGS,
     "gastro": COMMON_HASHTAGS + ["#books", "#recommendation", "#interior", "#movies", "#moscow"],
+    "dom":    COMMON_HASHTAGS,
 }
 
 # ============ Тип 1 (брендинг) — БЕЗ ИЗМЕНЕНИЙ ============
@@ -636,6 +638,9 @@ CHANNELS = {
     "gastro": {"title": "Ö GASTRO",
                "type1_logo": "logo_type1_gastro.png", "type1_box": (75, 119, 91, 40),
                "story_logo": "logo_cover_gastro.png",  "story_box": (196, 81)},
+    "dom":    {"title": "Ö DÖM",  # обложки пока не заданы — в сторис базовый вордмарк
+               "type1_logo": "logo_dom.png", "type1_box": (198, 90, 78, 52),
+               "story_logo": None, "story_box": None},
 }
 
 BASE_WORDMARK_FILE = "wordmark_white.png"  # широкий ÖMANKÖ: лента + база сторис
@@ -1225,7 +1230,8 @@ def channel_keyboard():
          InlineKeyboardButton(CHANNELS["beauty"]["title"], callback_data="channel:beauty")],
         [InlineKeyboardButton(CHANNELS["music"]["title"], callback_data="channel:music"),
          InlineKeyboardButton(CHANNELS["agency"]["title"], callback_data="channel:agency")],
-        [InlineKeyboardButton(CHANNELS["gastro"]["title"], callback_data="channel:gastro")],
+        [InlineKeyboardButton(CHANNELS["gastro"]["title"], callback_data="channel:gastro"),
+         InlineKeyboardButton(CHANNELS["dom"]["title"], callback_data="channel:dom")],
         [_BACK_BTN],
     ])
 
