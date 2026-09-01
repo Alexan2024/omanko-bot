@@ -627,7 +627,7 @@ CHANNELS = {
                "type1_logo": "logo_type1_news.png",   "type1_box": (72, 112, 91, 47),
                "story_logo": "logo_cover_news.png",    "story_box": (196, 81)},
     "girls": {"title": "Ö GIRLS",
-               "type1_logo": "logo_type1_girls.png", "type1_box": (72, 107, 91, 52),
+               "type1_logo": "logo_type1_girls.png", "type1_box": (79, 102, 91, 42),
                "story_logo": "logo_cover_girls.png",  "story_box": (196, 81)},
     "music":  {"title": "Ö MUSIC",
                "type1_logo": "logo_type1_music.png",  "type1_box": (89, 107, 91, 52),
