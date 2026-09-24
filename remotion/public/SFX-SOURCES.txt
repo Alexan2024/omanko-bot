@@ -1,0 +1,10 @@
+Звуки рилсов — студийные записи Mixkit (https://mixkit.co/free-sound-effects/), лицензия Mixkit Sound Effects
+Free License: можно в коммерческих роликах и соцсетях, указывать автора не нужно. Сами файлы — не для отдельного
+распространения, поэтому репозиторий бота лучше держать закрытым. Лицензия: https://mixkit.co/license/
+- sfx_move_1..5 — проход воздуха на переезде камеры: Mixkit 1474 «Transition windy swoosh», 1489 «Air woosh»,
+  1482 «Ending wind swoosh», 1471 «Cinematic wind swoosh», 1168 «Woosh wind»
+- sfx_page_1..3 — страница на смене работы в подборке: 1104 «Page turn single», 2380 «Paper quick movement»,
+  1101 «Single book paging» (второе перелистывание)
+- sfx_close_1..2 — страница на титре: 1105 «Big paper page turn», 1101 «Single book paging» (первое)
+Обработка: срез ниже 70 Гц, мягкий срез верха (5,5 кГц у воздуха, 7,5 кГц у бумаги), сглаженные щелчки,
+выровненная громкость. Свои звуки — /data/sfx (move*.wav, page*.wav, close*.wav): бот возьмёт их вместо этих.
