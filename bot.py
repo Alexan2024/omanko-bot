@@ -4,15 +4,26 @@ import json
 import asyncio
 import logging
 from datetime import datetime, time as dtime, timezone, timedelta
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageCms
 import pillow_avif  # noqa: F401 — регистрирует AVIF-декодер в Pillow
+try:
+    # HEIC/HEIF (оригиналы с iPhone, присланные файлом). Если пакета нет —
+    # бот работает как раньше, просто HEIC не откроется.
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIF_OK = True
+except Exception:
+    HEIF_OK = False
 import numpy as np
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
+                      InputMediaPhoto, InputMediaDocument)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters, ConversationHandler
+    CallbackQueryHandler, ContextTypes, filters, ConversationHandler,
+    TypeHandler, BaseUpdateProcessor
 )
-from telegram.error import Forbidden, RetryAfter
+from telegram.error import Forbidden, RetryAfter, TimedOut
+from telegram.helpers import escape_markdown
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -529,6 +540,8 @@ COVER_TITLE_LS_STORY = -0.06     # letter-spacing -6%
 COVER_TITLE_BOTTOM_IG = 452      # 424 + 28 (поднят выше)
 COVER_TITLE_BOTTOM_TG = 382      # 354 + 28 (поднят выше)
 COVER_LINE_SPACING = 1.08        # межстрочный множитель
+TITLE_SIDE_MARGIN = 0.06         # мин. поле слева/справа для заголовка и бабла (доля ширины)
+CUSTOM_HASHTAG_MAX = 24          # макс. длина своего хештега (без #)
 
 # Вордмарк ÖMANKÖ (всегда белый)
 WORDMARK_W_FEED = 326            # низ ленты, отступ снизу 65
@@ -663,6 +676,85 @@ def _load_logo(fname: str):
     img = Image.open(path).convert("RGBA")
     _LOGO_CACHE[fname] = img
     return img
+
+
+# ============ Открытие фото: ориентация + цветовой профиль ============
+_SRGB_PROFILE = ImageCms.createProfile("sRGB")
+
+
+def open_photo(data: bytes) -> Image.Image:
+    """Открывает присланное фото и приводит к «честному» RGB в sRGB.
+
+    1) EXIF-ориентация: файлы с телефона хранят поворот в метаданных, Pillow
+       его сам не применяет — без этого вертикальный кадр мог лечь на бок.
+    2) Цветовой профиль: iPhone снимает в Display P3. Простой convert("RGB")
+       отбрасывает профиль, и цвета тускнеют/сдвигаются. Здесь переводим
+       пиксели из встроенного профиля в sRGB (стандарт для веба и Telegram).
+    Любая ошибка на шаге 2 — тихий откат к прежнему поведению."""
+    img = Image.open(io.BytesIO(data))
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception as e:
+        logger.warning(f"EXIF-ориентация не применилась: {e}")
+
+    icc = img.info.get("icc_profile")
+    if icc:
+        try:
+            src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+            desc = (ImageCms.getProfileDescription(src) or "").lower()
+            if "srgb" not in desc:  # sRGB → sRGB гонять незачем
+                if img.mode == "CMYK":
+                    return ImageCms.profileToProfile(img, src, _SRGB_PROFILE,
+                                                     outputMode="RGB")
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                return ImageCms.profileToProfile(img, src, _SRGB_PROFILE,
+                                                 outputMode="RGB")
+        except Exception as e:
+            logger.warning(f"ICC-профиль не применился ({e}) — беру как есть")
+    return img.convert("RGB")
+
+
+def to_jpeg(img: Image.Image, quality: int = 92) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+# Рендер — тяжёлая синхронная работа. Гоняем её в отдельном потоке, чтобы бот
+# не «замерзал» для остальных, и ограничиваем число одновременных рендеров,
+# чтобы не выжрать память Railway, если постят сразу несколько человек.
+_RENDER_SEM = asyncio.Semaphore(2)
+
+
+async def run_render(fn, *args, **kwargs):
+    async with _RENDER_SEM:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+# ============ Автоподгонка текста (защита от вылета за края) ============
+def _tracked_width(text: str, font, ls_px: float) -> float:
+    """Ширина строки с трекингом (посимвольная отрисовка, как в рендерах)."""
+    if not text:
+        return 0.0
+    probe = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+    widths = [probe.textlength(c, font=font) for c in text]
+    return sum(widths) + ls_px * (len(text) - 1)
+
+
+def fit_size(text_lines, loader, size, max_w, ls_ratio=0.0, min_size=10):
+    """Максимальный кегль ≤ size, при котором самая широкая строка влезает в
+    max_w. Если и так влезает — возвращает size как есть (спека не меняется)."""
+    size = int(size)
+    while size > min_size:
+        font = loader(size)
+        widest = max((_tracked_width(ln, font, round(size * ls_ratio))
+                      for ln in text_lines), default=0)
+        if widest <= max_w:
+            return size
+        # шаг пропорционально перелёту, но минимум на 1px
+        size = max(min_size, min(size - 1, int(size * max_w / widest)))
+    return min_size
 
 
 # ============ Общие утилиты ============
@@ -881,7 +973,12 @@ def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str 
     canvas = canvas_rgba.convert("RGB")
 
     # ХЕШТЕГ
-    if hashtag and hashtag != "— Без хештега —":
+    if hashtag and hashtag != NO_HASHTAG:
+        # Длинный свой хештег не должен наезжать на логотип: если не влезает
+        # между лого и правым краем — уменьшаем кегль (обычные теги не трогаем).
+        max_tag_w = canvas_w - hashtag_right - (logo_x + logo_w + int(60 * scale))
+        hashtag_size = fit_size([hashtag], load_semibold, hashtag_size,
+                                max_tag_w, ls_ratio=-0.007)
         sample_x = max(0, canvas_w - hashtag_right - int(200 * scale))
         sample_y = max(0, canvas_h - hashtag_bottom - hashtag_size)
         hr, hg, hb = get_average_color(canvas, sample_x, sample_y, int(200 * scale), hashtag_size + 20)
@@ -895,8 +992,8 @@ def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str 
         spacing = int(hashtag_size * (-0.007))
         total_w = 0
         char_widths = []
-        for ch in hashtag:
-            bbox = draw.textbbox((0, 0), ch, font=font)
+        for glyph in hashtag:
+            bbox = draw.textbbox((0, 0), glyph, font=font)
             cw = bbox[2] - bbox[0]
             char_widths.append(cw)
             total_w += cw + spacing
@@ -904,8 +1001,8 @@ def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str 
         tx = canvas_w - hashtag_right - total_w
         ty = canvas_h - hashtag_bottom - hashtag_size
         cx = tx
-        for ch, cw in zip(hashtag, char_widths):
-            draw.text((cx, ty), ch, font=font, fill=fill)
+        for glyph, cw in zip(hashtag, char_widths):
+            draw.text((cx, ty), glyph, font=font, fill=fill)
             cx += cw + spacing
         canvas = overlay.convert("RGB")
 
@@ -1046,12 +1143,16 @@ def apply_bottom_gradient(canvas: Image.Image, brightness: float, rise: int,
 def draw_centered_title(canvas_rgba: Image.Image, text: str, size: int,
                         ls_ratio: float, bottom_offset: int):
     cw, ch = canvas_rgba.size
-    font = load_black(size)
-    draw = ImageDraw.Draw(canvas_rgba)
-    ls_px = round(size * ls_ratio)
     lines = [ln for ln in text.split("\n")]
     if not lines:
         return
+    # Автоподгонка: если самая длинная строка шире холста минус поля (6% с
+    # каждой стороны) — уменьшаем кегль. Нормальные заголовки не меняются.
+    size = fit_size(lines, load_black, size, cw * (1 - 2 * TITLE_SIDE_MARGIN),
+                    ls_ratio=ls_ratio)
+    font = load_black(size)
+    draw = ImageDraw.Draw(canvas_rgba)
+    ls_px = round(size * ls_ratio)
     ascent, descent = font.getmetrics()
     line_adv = int(size * COVER_LINE_SPACING)
     line_visual = ascent + descent
@@ -1077,7 +1178,11 @@ def draw_bubble(canvas_rgba: Image.Image, center_x: int, center_y: int,
     """Бабл. label=None -> пустой бабл (сторис).
     color_mode: 'dark' (фикс. тёмный, лента) | 'adaptive_invert' (инверт к фону, сторис).
     bubble_w=None -> авто-ширина под текст (лента)."""
-    font = load_semibold(BUBBLE_TEXT_SIZE) if label else None
+    font = None
+    if label:
+        # Бабл с длинным своим хештегом не должен вылезать за края ленты
+        max_text_w = canvas_rgba.size[0] * (1 - 2 * TITLE_SIDE_MARGIN) - 2 * FEED_BUBBLE_PAD_X
+        font = load_semibold(fit_size([label], load_semibold, BUBBLE_TEXT_SIZE, max_text_w))
     d = ImageDraw.Draw(canvas_rgba)
     tw = d.textlength(label, font=font) if label else 0
     if bubble_w is None:
@@ -1148,7 +1253,7 @@ def render_cover_feed(img: Image.Image, format_key: str, title: str, hashtag: st
     draw_centered_title(canvas, title, title_size, COVER_TITLE_LS_FEED, title_bottom)
 
     # бабл сверху по центру — тёмный плотный, с хештегом
-    if hashtag and hashtag != "— Без хештега —":
+    if hashtag and hashtag != NO_HASHTAG:
         cy = bubble_top + bubble_h // 2
         bg_for_bubble = canvas.convert("RGB")
         label = "# " + hashtag.lstrip("#")
@@ -1366,15 +1471,222 @@ def process_store(img: Image.Image, text: str, color=None) -> Image.Image:
     return canvas_rgba.convert("RGB")
 
 
+# ============ Сессия, повтор, доставка ============
+CONV_TIMEOUT_SEC = 30 * 60       # брошенная сессия закрывается через 30 мин тишины
+UPLOAD_DEBOUNCE_SEC = 1.5        # пауза после последнего фото перед статусом «Загружено: N»
+MEDIA_GROUP_MAX = 10             # лимит Telegram на альбом
+
+_MODE_NAMES = {"type1": "🏷 Брендинг", "cover": "🖼 Обложка",
+               "collab": "🤝 Коллаборация", "store": "🛍 STORE"}
+# Что переносим в «Ещё раз с теми же настройками»
+_LAST_KEYS = ("mode", "channel", "format", "hashtag", "title", "partner_logo",
+              "store_text", "store_color", "dark_idx")
+
+
+def reset_session(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Очищает текущую сессию (фото и т.д.), но сохраняет настройки прошлого
+    поста — они нужны кнопке «Ещё раз с теми же настройками»."""
+    last = context.user_data.get("_last")
+    context.user_data.clear()
+    if last:
+        context.user_data["_last"] = last
+
+
+def remember_last(context: ContextTypes.DEFAULT_TYPE) -> None:
+    ud = context.user_data
+    ud["_last"] = {k: ud[k] for k in _LAST_KEYS if k in ud}
+
+
+def done_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Ещё раз с теми же настройками", callback_data="again:repeat")],
+        [InlineKeyboardButton("🆕 Новый пост", callback_data="again:new")],
+    ])
+
+
+async def finish(message, context: ContextTypes.DEFAULT_TYPE, ok: int, total: int):
+    """Общий финал всех режимов: запоминаем настройки, чистим сессию, шлём итог
+    с кнопками повтора."""
+    remember_last(context)
+    reset_session(context)
+    text = "✅ Готово!" if ok == total else f"⚠️ Готово частично: {ok} из {total}."
+    await message.reply_text(text, reply_markup=done_keyboard())
+    return ConversationHandler.END
+
+
+def _short(text: str, n: int = 28) -> str:
+    t = " / ".join(ln.strip() for ln in (text or "").split("\n") if ln.strip())
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+def settings_summary(ud) -> str:
+    """Короткое описание настроек для экрана повтора (обычный текст)."""
+    mode = ud.get("mode", "type1")
+    parts = [_MODE_NAMES.get(mode, mode)]
+    if mode in ("type1", "cover"):
+        parts.append(CHANNELS.get(ud.get("channel", "base"), CHANNELS["base"])["title"])
+    if mode != "store" and ud.get("format"):
+        parts.append(ud["format"])
+    if mode in ("type1", "cover"):
+        tag = ud.get("hashtag")
+        parts.append("без хештега" if (not tag or tag == NO_HASHTAG) else tag)
+    if mode == "cover":
+        parts.append("затемнение: " + DARK_LEVEL_NAMES[ud.get("dark_idx", DARK_DEFAULT_IDX)])
+    if mode == "store":
+        col = ud.get("store_color")
+        if col is None:
+            parts.append("цвет: адаптивный")
+        else:
+            parts.append("цвет: #{:02X}{:02X}{:02X}".format(*col))
+    return " · ".join(parts)
+
+
+async def _send_docs(message, files) -> None:
+    """Отправка готовых файлов: один — документом, несколько — альбомом
+    документов (до 10). Если альбом не ушёл — досылаем по одному."""
+    if not files:
+        return
+    if len(files) == 1:
+        data, name = files[0]
+        await message.reply_document(document=data, filename=name, write_timeout=300)
+        return
+    media = [InputMediaDocument(media=data, filename=name) for data, name in files]
+    try:
+        await message.reply_media_group(media=media, write_timeout=300)
+    except TimedOut:
+        # Альбом мог уйти, просто ответ не дождались — повтор дал бы дубли
+        logger.warning("Альбом: таймаут ответа Telegram, повторно не шлю")
+    except RetryAfter as e:
+        await asyncio.sleep(int(e.retry_after) + 1)
+        await message.reply_media_group(media=media, write_timeout=300)
+    except Exception as e:
+        logger.warning(f"Альбом не отправился ({e}) — шлю по одному")
+        for data, name in files:
+            await message.reply_document(document=data, filename=name, write_timeout=300)
+
+
+async def deliver(message, photos, render_one) -> int:
+    """Рендер всех фото (в отдельном потоке) + отправка альбомами.
+    render_one(photo_bytes, i) -> [(jpeg_bytes, filename), ...] — синхронная.
+    Файлы одного фото в разные альбомы не разрываются (важно для обложек:
+    лента + IG + TG идут вместе). Возвращает число успешно обработанных фото."""
+    ok = 0
+    batch = []
+    for i, photo_bytes in enumerate(photos):
+        try:
+            await message.chat.send_action("upload_document")
+        except Exception:
+            pass
+        try:
+            files = await run_render(render_one, photo_bytes, i)
+        except Exception as e:
+            logger.error(f"Ошибка фото {i+1}: {e}")
+            await message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+            continue
+        if batch and len(batch) + len(files) > MEDIA_GROUP_MAX:
+            await _send_docs(message, batch)
+            batch = []
+        batch.extend(files)
+        ok += 1
+    if batch:
+        await _send_docs(message, batch)
+    return ok
+
+
+# ---- Статус загрузки фото (одно сообщение на пачку, а не на каждое фото) ----
+def upload_keyboard(n: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Готово ({n})", callback_data="photos:done"),
+         InlineKeyboardButton("🗑 Сбросить", callback_data="photos:reset")],
+        [_BACK_BTN],
+    ])
+
+
+def _upload_job_name(chat_id: int) -> str:
+    return f"upl:{chat_id}"
+
+
+def cancel_upload_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    jq = context.job_queue
+    if not jq:
+        return
+    for job in jq.get_jobs_by_name(_upload_job_name(chat_id)):
+        job.schedule_removal()
+
+
+async def _post_upload_status(bot, chat_id: int, ud) -> None:
+    photos = ud.get("photos") or []
+    if not photos:
+        return
+    old = ud.pop("upl_status", None)
+    if old:
+        try:
+            await bot.delete_message(chat_id, old)
+        except Exception:
+            pass
+    n = len(photos)
+    msg = await bot.send_message(
+        chat_id, f"📥 Загружено: *{n}* фото.\nДокидывай ещё или жми «Готово».",
+        parse_mode="Markdown", reply_markup=upload_keyboard(n))
+    ud["upl_status"] = msg.message_id
+
+
+async def _upload_status_job(context: ContextTypes.DEFAULT_TYPE):
+    await _post_upload_status(context.bot, context.job.chat_id, context.user_data)
+
+
+async def _drop_status_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Убирает кнопки со статуса загрузки (после «Готово»/Назад), чтобы
+    старые кнопки не висели в чате."""
+    mid = context.user_data.pop("upl_status", None)
+    if mid:
+        try:
+            await context.bot.edit_message_reply_markup(chat_id, mid, reply_markup=None)
+        except Exception:
+            pass
+
+
 # ============ Хендлеры ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_user(update.effective_chat.id)
-    context.user_data.clear()
-    await update.message.reply_text(
+    cancel_upload_status(context, update.effective_chat.id)
+    reset_session(context)
+    await update.effective_message.reply_text(
         "👋 Привет! Я Post Creator для ÖMANKÖ.\n\nЧто делаем?",
         reply_markup=type_keyboard()
     )
     return CHOOSING_TYPE
+
+
+async def again(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки после готового поста: 🔁 повтор с теми же настройками / 🆕 новый."""
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    chat_id = update.effective_chat.id
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    cancel_upload_status(context, chat_id)
+    last = context.user_data.get("_last")
+    reset_session(context)
+
+    if action == "repeat" and not last:
+        await query.message.reply_text(
+            "Настройки прошлого поста не сохранились (бот перезапускался) — "
+            "начнём с нуля 👇", reply_markup=type_keyboard())
+        return CHOOSING_TYPE
+    if action != "repeat":
+        add_user(chat_id)
+        await query.message.reply_text("Что делаем?", reply_markup=type_keyboard())
+        return CHOOSING_TYPE
+
+    context.user_data.update(last)
+    context.user_data["repeat"] = True
+    await query.message.reply_text(
+        photos_prompt_text(context), parse_mode="Markdown", reply_markup=back_keyboard())
+    return WAITING_PHOTOS
 
 
 async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1410,33 +1722,30 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSING_CHANNEL
 
 
+_FILE_HINT = "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
+
+
 def photos_prompt_text(context) -> str:
-    """Текст шага «пришли фото» — общий для прямого хода и для возврата «Назад»."""
-    mode = context.user_data.get("mode")
-    n = len(context.user_data.get("photos", []))
+    """Текст шага «пришли фото» — общий для прямого хода, повтора и «Назад»."""
+    ud = context.user_data
+    mode = ud.get("mode")
+    n = len(ud.get("photos", []))
     have = f"📂 Уже загружено: *{n}*. " if n else ""
+    tail = f"{have}Пришли фото, затем «Готово» или /done"
+    if ud.get("repeat"):
+        head = ("🔁 *Повтор:* " + escape_markdown(settings_summary(ud), version=1)
+                + "\n\nВсё как в прошлый раз — нужны только новые фото.")
+        if mode == "cover":
+            head += " Заголовок спрошу после фото."
+        elif mode == "store":
+            head += " Подпись спрошу после фото."
+        return head + "\n\n" + _FILE_HINT + tail
     if mode == "collab":
-        return (
-            "🤝 *Коллаборация* — логотип партнёра принят.\n\n"
-            "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
-            f"{have}Пришли фото, затем /done"
-        )
+        return "🤝 *Коллаборация* — логотип партнёра принят.\n\n" + _FILE_HINT + tail
     if mode == "store":
-        return (
-            "🛍 *ÖMANKÖ STORE*\n\n"
-            "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
-            f"{have}Пришли фото, затем /done"
-        )
-    channel = context.user_data.get("channel", "base")
-    note = ""
-    if mode != "cover":
-        note = "_(в Тип 1 логотип Ö общий для всех каналов)_\n\n"
-    return (
-        f"Канал: *{CHANNELS[channel]['title']}*\n\n"
-        f"{note}"
-        "📎 Отправляй фото как *файл* (скрепка → Файл), чтобы качество не сжалось.\n\n"
-        f"{have}Пришли фото, затем /done"
-    )
+        return "🛍 *ÖMANKÖ STORE*\n\n" + _FILE_HINT + tail
+    channel = ud.get("channel", "base")
+    return f"Канал: *{CHANNELS[channel]['title']}*\n\n" + _FILE_HINT + tail
 
 
 async def receive_partner_logo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1488,13 +1797,39 @@ async def choose_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photos = context.user_data.setdefault("photos", [])
-    if update.message.photo:
-        file = await update.message.photo[-1].get_file()
+    msg = update.message
+    if msg.photo:
+        file = await msg.photo[-1].get_file()
         photos.append(bytes(await file.download_as_bytearray()))
-    elif update.message.document and update.message.document.mime_type.startswith("image/"):
-        file = await update.message.document.get_file()
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file = await msg.document.get_file()
         photos.append(bytes(await file.download_as_bytearray()))
-    await update.message.reply_text(f"✅ {len(photos)} фото. Ещё или /done")
+
+    # Не отвечаем на каждое фото: ждём паузу после последнего и шлём ОДИН
+    # статус «Загружено: N» с кнопками. Альбом из 10 фото = 1 сообщение.
+    chat_id = update.effective_chat.id
+    cancel_upload_status(context, chat_id)
+    if context.job_queue:
+        context.job_queue.run_once(
+            _upload_status_job, UPLOAD_DEBOUNCE_SEC, chat_id=chat_id,
+            user_id=update.effective_user.id, name=_upload_job_name(chat_id))
+    else:
+        await _post_upload_status(context.bot, chat_id, context.user_data)
+    return WAITING_PHOTOS
+
+
+async def photos_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🗑 Сбросить: выкидываем все загруженные фото, остаёмся на том же шаге."""
+    query = update.callback_query
+    await query.answer("Сбросил")
+    cancel_upload_status(context, update.effective_chat.id)
+    context.user_data["photos"] = []
+    context.user_data.pop("upl_status", None)
+    try:
+        await query.edit_message_text(
+            "🗑 Все фото сброшены — присылай заново.", reply_markup=back_keyboard())
+    except Exception:
+        pass
     return WAITING_PHOTOS
 
 
@@ -1505,23 +1840,67 @@ STORE_TEXT_PROMPT = ("✍️ Пришли *текст подписи* для STO
                      "Перенос между строками ставь сам (Enter).")
 
 
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photos = context.user_data.get("photos", [])
+def _reuse_keyboard(ud, key: str, cb: str):
+    """Клавиатура шага ввода текста: при повторе — кнопка «тот же текст»."""
+    rows = []
+    if ud.get("repeat") and ud.get(key):
+        rows.append([InlineKeyboardButton(f"↩️ Тот же: «{_short(ud[key])}»",
+                                          callback_data=cb)])
+    rows.append([_BACK_BTN])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _proceed_after_photos(message, context: ContextTypes.DEFAULT_TYPE):
+    """Общий шаг после загрузки фото (/done или кнопка «Готово»)."""
+    ud = context.user_data
+    photos = ud.get("photos", [])
     if not photos:
-        await update.message.reply_text("Сначала отправь хотя бы одно фото!")
+        await message.reply_text("Сначала отправь хотя бы одно фото!")
         return WAITING_PHOTOS
-    if context.user_data.get("mode") == "cover":
-        await update.message.reply_text(
-            TITLE_PROMPT, parse_mode="Markdown", reply_markup=back_keyboard()
-        )
+    mode = ud.get("mode")
+    if mode == "cover":
+        await message.reply_text(TITLE_PROMPT, parse_mode="Markdown",
+                                 reply_markup=_reuse_keyboard(ud, "title", "reuse:title"))
         return WAITING_TITLE
-    if context.user_data.get("mode") == "store":
-        await update.message.reply_text(
-            STORE_TEXT_PROMPT, parse_mode="Markdown", reply_markup=back_keyboard()
-        )
+    if mode == "store":
+        await message.reply_text(STORE_TEXT_PROMPT, parse_mode="Markdown",
+                                 reply_markup=_reuse_keyboard(ud, "store_text", "reuse:store"))
         return WAITING_STORE_TEXT
-    await update.message.reply_text(
+    if ud.get("repeat"):
+        await message.reply_text(f"⚙️ Обрабатываю {len(photos)} фото...")
+        if mode == "collab":
+            return await generate_collab(message, context)
+        return await _render_with_hashtag(message, context, ud.get("hashtag", NO_HASHTAG))
+    await message.reply_text(
         f"📐 Выбери формат ({len(photos)} фото):", reply_markup=format_keyboard()
+    )
+    return CHOOSING_FORMAT
+
+
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    cancel_upload_status(context, chat_id)
+    await _drop_status_keyboard(context, chat_id)
+    return await _proceed_after_photos(update.message, context)
+
+
+async def photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    cancel_upload_status(context, chat_id)
+    await _drop_status_keyboard(context, chat_id)
+    return await _proceed_after_photos(query.message, context)
+
+
+async def _after_title(message, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("repeat"):
+        await message.reply_text("⚙️ Готовлю превью...")
+        return await _render_with_hashtag(message, context,
+                                          context.user_data.get("hashtag", NO_HASHTAG))
+    await message.reply_text(
+        "📐 Выбери формат ленты (сторис IG и TG добавлю автоматически):",
+        reply_markup=format_keyboard()
     )
     return CHOOSING_FORMAT
 
@@ -1532,11 +1911,17 @@ async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Заголовок пустой — пришли текст ещё раз.")
         return WAITING_TITLE
     context.user_data["title"] = title
-    await update.message.reply_text(
-        "📐 Выбери формат ленты (сторис IG и TG добавлю автоматически):",
-        reply_markup=format_keyboard()
-    )
-    return CHOOSING_FORMAT
+    return await _after_title(update.message, context)
+
+
+async def reuse_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    return await _after_title(query.message, context)
 
 
 async def choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1544,50 +1929,48 @@ async def choose_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data["format"] = query.data.split(":", 1)[1]
     if context.user_data.get("mode") == "collab":
-        return await generate_collab(update, context)
+        photos = context.user_data.get("photos", [])
+        await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
+        return await generate_collab(query.message, context)
     channel = context.user_data.get("channel", "base")
     await query.edit_message_text("Выбери хештег:", reply_markup=hashtag_keyboard(channel))
     return CHOOSING_HASHTAG
 
 
-async def generate_collab(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def generate_collab(message, context: ContextTypes.DEFAULT_TYPE):
     """Коллаборация: рендер всех фото с нижней строкой «ÖMANKÖ × партнёр».
-    Хештегов нет — генерим сразу после выбора формата."""
-    query = update.callback_query
+    Хештегов нет — генерим сразу после выбора формата (или сразу при повторе)."""
     fmt = context.user_data.get("format", "4:5")
     photos = context.user_data.get("photos", [])
     partner = context.user_data.get("partner_logo")
 
-    await query.edit_message_text(f"⚙️ Обрабатываю {len(photos)} фото...")
-
     if not partner:
-        await query.message.reply_text(
+        await message.reply_text(
             "Потерялся логотип партнёра 😅 Начни заново через /start.")
-        context.user_data.clear()
+        reset_session(context)
         return ConversationHandler.END
 
-    ok = 0
-    for i, photo_bytes in enumerate(photos):
-        try:
-            img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            result = process_collab(img, fmt, partner)
-            buf = io.BytesIO()
-            result.save(buf, format="JPEG", quality=92)
-            buf.seek(0)
-            await query.message.reply_document(document=buf, filename=f"collab_{i+1}.jpg")
-            ok += 1
-        except Exception as e:
-            logger.error(f"Ошибка коллаб-фото {i+1}: {e}")
-            await query.message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+    def render_one(photo_bytes, i):
+        res = process_collab(open_photo(photo_bytes), fmt, partner)
+        return [(to_jpeg(res), f"collab_{i+1}.jpg")]
 
+    ok = await deliver(message, photos, render_one)
     record_post(context.user_data.get("channel", "base"), "collab", ok)
-    context.user_data.clear()
-    await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
-    return ConversationHandler.END
+    return await finish(message, context, ok, len(photos))
+
+
+async def _after_store_text(message, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("repeat"):
+        await message.reply_text("⚙️ Обрабатываю фото...")
+        return await generate_store(message, context)
+    await message.reply_text(
+        "🎨 *Цвет графики* (логотип + текст):",
+        parse_mode="Markdown", reply_markup=store_color_keyboard())
+    return CHOOSING_STORE_COLOR
 
 
 async def receive_store_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """STORE: приём подписи (до 2 строк) → переход к выбору цвета графики."""
+    """STORE: приём подписи (до 2 строк) → выбор цвета (или сразу рендер при повторе)."""
     text = (update.message.text or "").strip("\n")
     if not text.strip():
         await update.message.reply_text(
@@ -1595,23 +1978,31 @@ async def receive_store_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=back_keyboard())
         return WAITING_STORE_TEXT
     context.user_data["store_text"] = text
-    await update.message.reply_text(
-        "🎨 *Цвет графики* (логотип + текст):",
-        parse_mode="Markdown", reply_markup=store_color_keyboard())
-    return CHOOSING_STORE_COLOR
+    return await _after_store_text(update.message, context)
 
 
-def _render_store_preview(context: ContextTypes.DEFAULT_TYPE, idx: int) -> bytes:
-    """Превью первого фото на текущем оттенке слайдера (уменьшенное, для скорости)."""
-    photos = context.user_data.get("photos", [])
-    text = context.user_data.get("store_text", "")
-    img = Image.open(io.BytesIO(photos[0])).convert("RGB")
-    res = process_store(img, text, color=_store_gray_value(idx))
+async def reuse_store_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    return await _after_store_text(query.message, context)
+
+
+def _render_store_preview(photo_bytes: bytes, text: str, idx: int) -> bytes:
+    """Превью первого фото на текущем оттенке слайдера (уменьшенное, для скорости).
+    Синхронная — вызывается через run_render."""
+    res = process_store(open_photo(photo_bytes), text, color=_store_gray_value(idx))
     res.thumbnail((1200, 1500), Image.LANCZOS)
-    buf = io.BytesIO()
-    res.save(buf, format="JPEG", quality=85)
-    buf.seek(0)
-    return buf.getvalue()
+    return to_jpeg(res, quality=85)
+
+
+async def _store_preview(context: ContextTypes.DEFAULT_TYPE, idx: int) -> bytes:
+    ud = context.user_data
+    return await run_render(_render_store_preview, ud.get("photos", [])[0],
+                            ud.get("store_text", ""), idx)
 
 
 def _store_slider_caption(idx: int) -> str:
@@ -1640,7 +2031,7 @@ async def choose_store_color(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # custom → ЧБ-слайдер с живым превью
     idx = STORE_GRAY_DEFAULT_IDX
     context.user_data["store_gray_idx"] = idx
-    preview = _render_store_preview(context, idx)
+    preview = await _store_preview(context, idx)
     if query.message.photo:
         await query.edit_message_media(
             InputMediaPhoto(media=io.BytesIO(preview),
@@ -1683,7 +2074,7 @@ async def store_gray_slider(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return STORE_COLOR_SLIDER
     context.user_data["store_gray_idx"] = new_idx
     await query.answer()
-    preview = _render_store_preview(context, new_idx)
+    preview = await _store_preview(context, new_idx)
     try:
         await query.edit_message_media(
             InputMediaPhoto(media=io.BytesIO(preview),
@@ -1729,66 +2120,51 @@ async def back_store_slider_to_color(update: Update, context: ContextTypes.DEFAU
 
 
 async def generate_store(message, context: ContextTypes.DEFAULT_TYPE):
-    """STORE: рендер всех фото в формат витрины 2000×2500 и отправка файлами."""
+    """STORE: рендер всех фото в формат витрины 2000×2500 и отправка альбомом."""
     photos = context.user_data.get("photos", [])
     text = context.user_data.get("store_text", "")
     color = context.user_data.get("store_color")  # None=адаптивный или (r,g,b)
-    ok = 0
-    for i, photo_bytes in enumerate(photos):
-        try:
-            img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            result = process_store(img, text, color=color)
-            buf = io.BytesIO()
-            result.save(buf, format="JPEG", quality=92)
-            buf.seek(0)
-            await message.reply_document(document=buf, filename=f"store_{i+1}.jpg")
-            ok += 1
-        except Exception as e:
-            logger.error(f"Ошибка стор-фото {i+1}: {e}")
-            await message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+    context.user_data["store_color"] = color       # ключ нужен для повтора
 
+    def render_one(photo_bytes, i):
+        res = process_store(open_photo(photo_bytes), text, color=color)
+        return [(to_jpeg(res), f"store_{i+1}.jpg")]
+
+    ok = await deliver(message, photos, render_one)
     record_post(context.user_data.get("channel", "base"), "store", ok)
-    context.user_data.clear()
-    await message.reply_text("✅ Готово! /start чтобы начать заново.")
-    return ConversationHandler.END
+    return await finish(message, context, ok, len(photos))
 
 
 async def _send_covers(message, photos, title, hashtag, fmt, channel, dark_idx) -> int:
     """Рендер + отправка обложек (feed/ig/tg) для всех фото на заданном уровне
-    затемнения. Используется и при первой генерации, и при ручной регулировке.
+    затемнения. Тройка одного фото всегда уходит в одном альбоме.
     Возвращает число успешно обработанных фото."""
     level = DARK_LEVELS[dark_idx]
-    ok = 0
-    for i, photo_bytes in enumerate(photos):
-        try:
-            img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            feed = render_cover_feed(img, fmt, title, hashtag, dark_level=level)
-            ig = render_cover_story(img, "ig", title, hashtag, channel=channel, dark_level=level)
-            tg = render_cover_story(img, "tg", title, hashtag, channel=channel, dark_level=level)
-            for result, suffix in ((feed, "feed"), (ig, "ig"), (tg, "tg")):
-                buf = io.BytesIO()
-                result.save(buf, format="JPEG", quality=92)
-                buf.seek(0)
-                await message.reply_document(document=buf, filename=f"cover_{i+1}_{suffix}.jpg")
-            ok += 1
-        except Exception as e:
-            logger.error(f"Ошибка обложки {i+1}: {e}")
-            await message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
-    return ok
+
+    def render_one(photo_bytes, i):
+        img = open_photo(photo_bytes)
+        feed = render_cover_feed(img, fmt, title, hashtag, dark_level=level)
+        ig = render_cover_story(img, "ig", title, hashtag, channel=channel, dark_level=level)
+        tg = render_cover_story(img, "tg", title, hashtag, channel=channel, dark_level=level)
+        return [(to_jpeg(r), f"cover_{i+1}_{sfx}.jpg")
+                for r, sfx in ((feed, "feed"), (ig, "ig"), (tg, "tg"))]
+
+    return await deliver(message, photos, render_one)
 
 
-def _render_cover_preview(context: ContextTypes.DEFAULT_TYPE, idx: int) -> bytes:
+def _render_cover_preview(photo_bytes, fmt, title, hashtag, idx) -> bytes:
     """Превью обложки (лента, первое фото) на текущем уровне затемнения —
-    уменьшенное, для скорости. По нему пользователь подбирает плотность."""
-    sess = context.user_data["cover_session"]
-    img = Image.open(io.BytesIO(sess["photos"][0])).convert("RGB")
-    res = render_cover_feed(img, sess["fmt"], sess["title"], sess["hashtag"],
+    уменьшенное, для скорости. Синхронная — вызывается через run_render."""
+    res = render_cover_feed(open_photo(photo_bytes), fmt, title, hashtag,
                             dark_level=DARK_LEVELS[idx])
     res.thumbnail((1200, 1500), Image.LANCZOS)
-    buf = io.BytesIO()
-    res.save(buf, format="JPEG", quality=85)
-    buf.seek(0)
-    return buf.getvalue()
+    return to_jpeg(res, quality=85)
+
+
+async def _cover_preview(context: ContextTypes.DEFAULT_TYPE, idx: int) -> bytes:
+    sess = context.user_data["cover_session"]
+    return await run_render(_render_cover_preview, sess["photos"][0], sess["fmt"],
+                            sess["title"], sess["hashtag"], idx)
 
 
 def _cover_slider_caption(idx: int) -> str:
@@ -1798,47 +2174,38 @@ def _cover_slider_caption(idx: int) -> str:
 
 
 async def _render_with_hashtag(message, context: ContextTypes.DEFAULT_TYPE, hashtag: str):
-    """Общий рендер для обоих путей выбора хештега (кнопка из списка / свой текст).
-    Сообщение со статусом «Обрабатываю…» каждый путь шлёт сам — здесь только рендер."""
-    fmt = context.user_data.get("format", "4:5")
-    photos = context.user_data.get("photos", [])
-    mode = context.user_data.get("mode", "type1")
-    channel = context.user_data.get("channel", "base")
+    """Общий рендер для обоих путей выбора хештега (кнопка из списка / свой текст)
+    и для повтора. Статус «Обрабатываю…» каждый путь шлёт сам."""
+    ud = context.user_data
+    ud["hashtag"] = hashtag
+    fmt = ud.get("format", "4:5")
+    photos = ud.get("photos", [])
+    mode = ud.get("mode", "type1")
+    channel = ud.get("channel", "base")
 
     if mode == "cover":
-        title = context.user_data.get("title", "")
-        idx = DARK_DEFAULT_IDX
+        title = ud.get("title", "")
+        # При повторе слайдер стартует с прошлого уровня затемнения
+        idx = ud.get("dark_idx", DARK_DEFAULT_IDX)
         # Не генерируем сразу: сначала слайдер затемнения с живым превью.
-        # Параметры держим в сессии — по ним рисуем превью и финальный рендер.
-        context.user_data["cover_session"] = {
+        ud["cover_session"] = {
             "photos": photos, "title": title, "hashtag": hashtag,
             "fmt": fmt, "channel": channel, "dark_idx": idx,
         }
-        preview = _render_cover_preview(context, idx)
+        preview = await _cover_preview(context, idx)
         await message.reply_photo(
             photo=io.BytesIO(preview), caption=_cover_slider_caption(idx),
             parse_mode="Markdown", reply_markup=cover_dark_keyboard(idx))
         return COVER_DARK_SLIDER
 
     # ---- Тип 1 (брендинг) ----
-    ok = 0
-    for i, photo_bytes in enumerate(photos):
-        try:
-            img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            result = process_image(img, fmt, hashtag, channel=channel)
-            buf = io.BytesIO()
-            result.save(buf, format="JPEG", quality=92)
-            buf.seek(0)
-            await message.reply_document(document=buf, filename=f"1_{i+1}.jpg")
-            ok += 1
-        except Exception as e:
-            logger.error(f"Ошибка фото {i+1}: {e}")
-            await message.reply_text(f"❌ Ошибка с фото {i+1}: {e}")
+    def render_one(photo_bytes, i):
+        res = process_image(open_photo(photo_bytes), fmt, hashtag, channel=channel)
+        return [(to_jpeg(res), f"1_{i+1}.jpg")]
 
+    ok = await deliver(message, photos, render_one)
     record_post(channel, mode, ok)
-    context.user_data.clear()
-    await message.reply_text("✅ Готово! /start чтобы начать заново.")
-    return ConversationHandler.END
+    return await finish(message, context, ok, len(photos))
 
 
 async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1850,7 +2217,9 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tag == CUSTOM_HASHTAG_CB:
         await query.edit_message_text(
             "✍️ Кидай свой хештег одним словом 🔥\n"
-            "Можно с # или без — решётку добавлю сам. Например: лето"
+            "Можно с # или без — решётку добавлю сам. Например: лето\n"
+            f"До {CUSTOM_HASHTAG_MAX} символов.",
+            reply_markup=back_keyboard()
         )
         return WAITING_CUSTOM_HASHTAG
 
@@ -1865,6 +2234,11 @@ async def receive_custom_hashtag(update: Update, context: ContextTypes.DEFAULT_T
     token = token.lstrip("#").strip()
     if not token:
         await update.message.reply_text("Пустой хештег — пришли ещё раз, например: лето")
+        return WAITING_CUSTOM_HASHTAG
+    if len(token) > CUSTOM_HASHTAG_MAX:
+        await update.message.reply_text(
+            f"Длинновато 😅 Максимум {CUSTOM_HASHTAG_MAX} символов, а тут {len(token)}. "
+            "Пришли покороче.", reply_markup=back_keyboard())
         return WAITING_CUSTOM_HASHTAG
     hashtag = "#" + token
 
@@ -1901,9 +2275,9 @@ async def cover_dark_slider(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok = await _send_covers(query.message, sess["photos"], sess["title"],
                                 sess["hashtag"], sess["fmt"], sess["channel"], idx)
         record_post(sess["channel"], "cover", ok)
-        context.user_data.clear()
-        await query.message.reply_text("✅ Готово! /start чтобы начать заново.")
-        return ConversationHandler.END
+        context.user_data["dark_idx"] = idx
+        context.user_data.pop("cover_session", None)
+        return await finish(query.message, context, ok, len(sess["photos"]))
 
     idx = sess["dark_idx"]
     new_idx = max(0, min(len(DARK_LEVELS) - 1, idx + (1 if action == "up" else -1)))
@@ -1912,7 +2286,7 @@ async def cover_dark_slider(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return COVER_DARK_SLIDER
     sess["dark_idx"] = new_idx
     await query.answer()
-    preview = _render_cover_preview(context, new_idx)
+    preview = await _cover_preview(context, new_idx)
     try:
         await query.edit_message_media(
             InputMediaPhoto(media=io.BytesIO(preview),
@@ -1938,9 +2312,37 @@ async def back_cover_slider(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+    cancel_upload_status(context, update.effective_chat.id)
+    reset_session(context)
     await update.message.reply_text("Отменено. /start чтобы начать заново.")
     return ConversationHandler.END
+
+
+async def on_timeout(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Сессия брошена дольше CONV_TIMEOUT_SEC: освобождаем память (фото, логотип
+    партнёра) и коротко сообщаем. Настройки для повтора сохраняются."""
+    chat = update.effective_chat if isinstance(update, Update) else None
+    if chat:
+        cancel_upload_status(context, chat.id)
+    reset_session(context)
+    if chat:
+        try:
+            await context.bot.send_message(
+                chat.id,
+                "⏳ Сессия закрыта — полчаса тишины. Загруженные фото удалил из памяти.\n"
+                "/start — начать заново.")
+        except Exception:
+            pass
+
+
+async def stale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажата кнопка из старого/закрытого диалога — отвечаем, чтобы не крутился
+    бесконечный «часик» на кнопке."""
+    try:
+        await update.callback_query.answer(
+            "Эта кнопка уже неактуальна 🙂 /start — новый пост", show_alert=False)
+    except Exception:
+        pass
 
 
 # ============ Навигация «Назад» ============
@@ -1954,7 +2356,12 @@ async def back_to_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    mode = context.user_data.get("mode", "type1")
+    ud = context.user_data
+    cancel_upload_status(context, update.effective_chat.id)
+    if ud.get("upl_status") == query.message.message_id:
+        ud.pop("upl_status", None)  # это сообщение сейчас станет меню — не удалять
+    ud.pop("repeat", None)  # ушли назад — дальше обычный путь со всеми шагами
+    mode = ud.get("mode", "type1")
     if mode == "collab":
         await query.edit_message_text(
             "Режим: *Коллаборация* 🤝\n\n"
@@ -2053,7 +2460,8 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "bc:no":
-        context.user_data.clear()
+        context.user_data.pop("bc_chat", None)
+        context.user_data.pop("bc_msg", None)
         await query.edit_message_text("Рассылка отменена.")
         return ConversationHandler.END
 
@@ -2087,7 +2495,8 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if dead:
         remove_users(dead)
 
-    context.user_data.clear()
+    context.user_data.pop("bc_chat", None)
+    context.user_data.pop("bc_msg", None)
     report = f"✅ Готово.\nДоставлено: {sent}\nНе доставлено: {failed}"
     if dead:
         report += f"\nУбрал заблокировавших: {len(dead)}"
@@ -2220,15 +2629,48 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Не смог отправить карточку статистики: {e}")
 
 
+class PerUserUpdateProcessor(BaseUpdateProcessor):
+    """Параллельная обработка апдейтов РАЗНЫХ людей, но строго по очереди для
+    одного и того же чата. Так один человек, рендерящий 10 обложек, не
+    замораживает бота для остальных, а у каждого диалог идёт в правильном
+    порядке (фото альбома — по порядку, двойной клик по слайдеру — без гонок)."""
+
+    def __init__(self, max_concurrent_updates: int = 64):
+        super().__init__(max_concurrent_updates)
+        self._locks = {}
+
+    async def do_process_update(self, update, coroutine):
+        key = None
+        if isinstance(update, Update):
+            if update.effective_chat:
+                key = update.effective_chat.id
+            elif update.effective_user:
+                key = update.effective_user.id
+        if key is None:
+            await coroutine
+            return
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await coroutine
+
+    async def initialize(self):
+        pass
+
+    async def shutdown(self):
+        pass
+
+
 def main():
     app = (
         Application.builder()
         .token(TOKEN)
         .read_timeout(120).write_timeout(120).connect_timeout(30)
+        .concurrent_updates(PerUserUpdateProcessor(64))
         .build()
     )
+    again_handler = CallbackQueryHandler(again, pattern="^again:")
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("start", start), again_handler],
         states={
             CHOOSING_TYPE: [CallbackQueryHandler(choose_type, pattern="^type:")],
             CHOOSING_CHANNEL: [
@@ -2242,10 +2684,13 @@ def main():
             WAITING_PHOTOS: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photos),
                 CommandHandler("done", done),
+                CallbackQueryHandler(photos_done, pattern="^photos:done$"),
+                CallbackQueryHandler(photos_reset, pattern="^photos:reset$"),
                 CallbackQueryHandler(back_to_channel, pattern="^nav:back$"),
             ],
             WAITING_TITLE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title),
+                CallbackQueryHandler(reuse_title, pattern="^reuse:title$"),
                 CallbackQueryHandler(back_to_photos, pattern="^nav:back$"),
             ],
             CHOOSING_FORMAT: [
@@ -2262,6 +2707,7 @@ def main():
             ],
             WAITING_STORE_TEXT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_store_text),
+                CallbackQueryHandler(reuse_store_text, pattern="^reuse:store$"),
                 CallbackQueryHandler(back_to_photos, pattern="^nav:back$"),
             ],
             CHOOSING_STORE_COLOR: [
@@ -2276,8 +2722,12 @@ def main():
                 CallbackQueryHandler(cover_dark_slider, pattern="^cdark:"),
                 CallbackQueryHandler(back_cover_slider, pattern="^nav:back$"),
             ],
+            # Брошенная сессия: чистим фото из памяти и сообщаем
+            ConversationHandler.TIMEOUT: [TypeHandler(Update, on_timeout)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start),
+                   again_handler],
+        conversation_timeout=CONV_TIMEOUT_SEC,
     )
     bc_conv = ConversationHandler(
         entry_points=[CommandHandler("broadcast", broadcast_start)],
@@ -2286,6 +2736,7 @@ def main():
             BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_confirm, pattern="^bc:")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        conversation_timeout=CONV_TIMEOUT_SEC,
     )
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("stats", stats_cmd))
@@ -2293,11 +2744,14 @@ def main():
     app.add_handler(CommandHandler(UNSUBSCRIBE_CMD, stats_unsubscribe))
     app.add_handler(bc_conv)
     app.add_handler(conv)
+    # Последним: кнопки из закрытых/старых диалогов — просто гасим «часики»
+    app.add_handler(CallbackQueryHandler(stale_callback))
 
     logger.info(
         f"Хранилище: {DATA_DIR} "
         f"({'постоянное (Volume)' if STORAGE_PERSISTENT else 'ВРЕМЕННОЕ — нужен Volume!'})"
     )
+    logger.info(f"HEIC/HEIF: {'включён' if HEIF_OK else 'нет pillow-heif — HEIC не откроется'}")
     if app.job_queue:
         app.job_queue.run_daily(
             weekly_stats_job,
