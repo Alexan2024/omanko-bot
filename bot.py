@@ -6,6 +6,9 @@ import math
 import asyncio
 import logging
 import secrets
+import shutil
+import subprocess
+import tempfile
 import unicodedata
 from datetime import datetime, time as dtime, timezone, timedelta
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageCms, features
@@ -208,8 +211,8 @@ def save_stats(events) -> None:
 
 
 def record_post(channel: str, mode: str, n_photos: int,
-                partner: str = None, kind: str = None) -> None:
-    if n_photos <= 0:
+                partner: str = None, kind: str = None, videos: int = 0) -> None:
+    if n_photos + videos <= 0:
         return
     events = load_stats()
     ev = {
@@ -222,6 +225,8 @@ def record_post(channel: str, mode: str, n_photos: int,
         ev["partner"] = partner      # имя партнёра коллаба
     if kind:
         ev["kind"] = kind            # коллаб: type1 (брендинг) | cover (обложка)
+    if videos:
+        ev["videos"] = int(videos)   # промаркированные ролики
     events.append(ev)
     if len(events) > _STATS_CAP:
         events = events[-_STATS_CAP:]
@@ -249,8 +254,8 @@ def build_weekly_report(events, until=None) -> str:
     until = until or datetime.now(MSK)
     since = until - timedelta(days=7)
 
-    chans = {k: {"posts": 0, "photos": 0} for k in CHANNELS}
-    total_posts = total_photos = type1_photos = cover_photos = 0
+    chans = {k: {"posts": 0, "photos": 0, "videos": 0} for k in CHANNELS}
+    total_posts = total_photos = type1_photos = cover_photos = total_videos = 0
     store_photos = collab_photos = 0
     partners = {}
 
@@ -268,10 +273,13 @@ def build_weekly_report(events, until=None) -> str:
         if ch not in chans:
             ch = "base"
         ph = int(e.get("photos", 0))
+        vd = int(e.get("videos", 0))
         chans[ch]["posts"] += 1
         chans[ch]["photos"] += ph
+        chans[ch]["videos"] += vd
         total_posts += 1
         total_photos += ph
+        total_videos += vd
         mode = e.get("mode")
         if mode == "cover":
             cover_photos += ph
@@ -294,7 +302,7 @@ def build_weekly_report(events, until=None) -> str:
         f"📊 *Итоги недели* ({period})",
         "",
         f"🔥 Всего: *{total_posts}* {_plural_post(total_posts)} · "
-        f"*{total_photos}* фото",
+        f"*{total_photos}* фото" + (f" · *{total_videos}* видео" if total_videos else ""),
         "",
         "*По каналам:*",
     ]
@@ -303,7 +311,8 @@ def build_weekly_report(events, until=None) -> str:
         if c["posts"] == 0:
             continue
         lines.append(f"• {CHANNELS[k]['title']}: "
-                     f"{c['posts']} {_plural_post(c['posts'])}, {c['photos']} фото")
+                     f"{c['posts']} {_plural_post(c['posts'])}, {c['photos']} фото"
+                     + (f", {c['videos']} видео" if c["videos"] else ""))
     lines += [
         "",
         "*По типам (фото):*",
@@ -1057,23 +1066,57 @@ def draw_logo(canvas: Image.Image, x: int, y: int, w: int, h: int, color: tuple)
     d.ellipse(inner, fill=(0, 0, 0, 0))
     d.ellipse([int(79 * sx), int(0 * sy), int(164 * sx), int(85 * sy)], fill=fill)
     d.ellipse([int(201 * sx), int(0 * sy), int(286 * sx), int(85 * sy)], fill=fill)
-    canvas.paste(vlogo, (x, y), vlogo)
+    canvas.alpha_composite(vlogo, (x, y))
 
 
-def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str = "base") -> Image.Image:
-    """ТИП 1 — брендинг. Логотип: у базового/agency — векторный Ö (как раньше),
-    у остальных каналов — свой PNG-логотип своего размера, адаптивно перекрашенный."""
+# ============ Слой маркировки (общий для фото и видео) ============
+# Вся графика брендинга и коллаба рисуется на ПРОЗРАЧНЫЙ слой размером с холст,
+# а цвета берутся с фона по тем же правилам, что всегда. Фото = фон + слой.
+# Видео = тот же слой поверх каждого кадра (фон для замера цвета — средний
+# кадр ролика). Одна функция на оба случая — правила не разъедутся.
+def text_on_layer(layer: Image.Image, items, font, color) -> None:
+    """Текст на RGBA-слой с честной альфой (работает и на прозрачном слое).
+    items — [((x, y), текст), ...]: всё рисуется одной маской и кладётся одним
+    проходом. Цвет сплошной, прозрачность = сглаживание глифа — ровно то, что
+    раньше давал draw.text на непрозрачном холсте."""
+    mask = Image.new("L", layer.size, 0)
+    md = ImageDraw.Draw(mask)
+    for xy, t in items:
+        md.text(xy, t, font=font, fill=255)
+    box = mask.getbbox()
+    if not box:
+        return
+    solid = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]),
+                      (int(color[0]), int(color[1]), int(color[2]), 0))
+    solid.putalpha(mask.crop(box))
+    layer.alpha_composite(solid, (box[0], box[1]))
+
+
+def new_layer(size) -> Image.Image:
+    return Image.new("RGBA", size, (0, 0, 0, 0))
+
+
+def apply_layer(bg: Image.Image, layer: Image.Image) -> Image.Image:
+    """Фон + слой маркировки → готовая картинка RGB."""
+    return Image.alpha_composite(bg.convert("RGBA"), layer).convert("RGB")
+
+
+def branding_canvas_size(format_key: str, src_w: int, src_h: int):
+    """Холст брендинга/коллаба для фото: фикс. формат или адаптивный
+    (по исходнику, но не уже 1920px)."""
     fmt = FORMATS[format_key]
-    if fmt is None:
-        if img.width < 1920:
-            scale = 1920 / img.width
-            canvas_w = 1920
-            canvas_h = int(img.height * scale)
-        else:
-            canvas_w, canvas_h = img.size
-    else:
-        canvas_w, canvas_h = fmt
+    if fmt is not None:
+        return fmt
+    if src_w < 1920:
+        scale = 1920 / src_w
+        return 1920, int(src_h * scale)
+    return src_w, src_h
 
+
+def type1_layer(bg: Image.Image, hashtag: str, channel: str = "base") -> Image.Image:
+    """ТИП 1 — слой брендинга (лого канала + хештег) под фон bg.
+    Геометрия — от опорной ширины 1920px, масштабируется под любой холст."""
+    canvas_w, canvas_h = bg.size
     scale = canvas_w / 1920
 
     # Геометрия логотипа: своя у канала (type1_box), иначе дефолтные LOGO_*
@@ -1090,33 +1133,38 @@ def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str 
         logo_x = int(LOGO_LEFT * scale)
         logo_y = canvas_h - int(LOGO_BOTTOM * scale) - logo_h
 
-    canvas = fit_image_to_canvas(img, canvas_w, canvas_h)
-
+    layer = new_layer(bg.size)
     # ЛОГОТИП — адаптивный цвет по фону под ним
-    r, g, b = get_average_color(canvas, logo_x, logo_y, logo_w, logo_h)
+    r, g, b = get_average_color(bg, logo_x, logo_y, logo_w, logo_h)
     percent = BRIGHTNESS_OFFSET if brightness_of(r, g, b) < 128 else -BRIGHTNESS_OFFSET
     logo_color = adjust_brightness(r, g, b, percent)
-    canvas_rgba = canvas.convert("RGBA")
     placed = False
     if ch["type1_logo"]:
-        placed = paste_type1_channel_logo(canvas_rgba, ch["type1_logo"],
+        placed = paste_type1_channel_logo(layer, ch["type1_logo"],
                                           logo_x, logo_y, logo_w, logo_h, logo_color)
     if not placed:
-        draw_logo(canvas_rgba, logo_x, logo_y, logo_w, logo_h, logo_color)
-    canvas = canvas_rgba.convert("RGB")
+        draw_logo(layer, logo_x, logo_y, logo_w, logo_h, logo_color)
 
     # ХЕШТЕГ: не заходит левее лого (+60px воздуха)
-    return draw_corner_hashtag(canvas, hashtag, scale, logo_x + logo_w + int(60 * scale))
+    corner_hashtag_on_layer(layer, bg, hashtag, scale, logo_x + logo_w + int(60 * scale))
+    return layer
 
 
-def draw_corner_hashtag(canvas: Image.Image, hashtag: str, scale: float,
-                        left_limit: int, force=None) -> Image.Image:
+def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str = "base") -> Image.Image:
+    """ТИП 1 — брендинг фото: фон по формату + слой брендинга."""
+    bg = fit_image_to_canvas(img, *branding_canvas_size(format_key, img.width, img.height))
+    return apply_layer(bg, type1_layer(bg, hashtag, channel))
+
+
+def corner_hashtag_on_layer(layer: Image.Image, bg: Image.Image, hashtag: str,
+                            scale: float, left_limit: int, force=None) -> None:
     """Хештег в правом нижнем углу (брендинг и коллаб). Длинный хештег не
-    заходит левее left_limit — кегль уменьшается. force — ручное направление
-    цвета ('light'/'dark'), None — адаптивно, как всегда."""
+    заходит левее left_limit — кегль уменьшается. Цвет замеряется по фону с уже
+    положенной графикой (как раньше). force — ручное направление цвета
+    ('light'/'dark'), None — адаптивно, как всегда."""
     if not hashtag or hashtag == NO_HASHTAG:
-        return canvas
-    canvas_w, canvas_h = canvas.size
+        return
+    canvas_w, canvas_h = layer.size
     hashtag_right = int(HASHTAG_RIGHT * scale)
     hashtag_bottom = int(HASHTAG_BOTTOM * scale)
     hashtag_size = int(HASHTAG_SIZE * scale)
@@ -1125,29 +1173,31 @@ def draw_corner_hashtag(canvas: Image.Image, hashtag: str, scale: float,
                             max_tag_w, ls_ratio=-0.007)
     sample_x = max(0, canvas_w - hashtag_right - int(200 * scale))
     sample_y = max(0, canvas_h - hashtag_bottom - hashtag_size)
-    hr, hg, hb = get_average_color(canvas, sample_x, sample_y, int(200 * scale), hashtag_size + 20)
+    sample_w, sample_h = int(200 * scale), hashtag_size + 20
+    view = Image.alpha_composite(
+        bg.crop((sample_x, sample_y, sample_x + sample_w, sample_y + sample_h)).convert("RGBA"),
+        layer.crop((sample_x, sample_y, sample_x + sample_w, sample_y + sample_h)))
+    hr, hg, hb = get_average_color(view, 0, 0, sample_w, sample_h)
     hcr, hcg, hcb = adjust_brightness(hr, hg, hb, adaptive_percent(hr, hg, hb, force))
 
-    overlay = canvas.convert("RGBA")
-    draw = ImageDraw.Draw(overlay)
     font = load_semibold(hashtag_size)
-    fill = (hcr, hcg, hcb, int(255 * ALPHA))
     spacing = int(hashtag_size * (-0.007))
     total_w = 0
     char_widths = []
     for glyph in hashtag:
-        bbox = draw.textbbox((0, 0), glyph, font=font)
+        bbox = _PROBE.textbbox((0, 0), glyph, font=font)
         cw = bbox[2] - bbox[0]
         char_widths.append(cw)
         total_w += cw + spacing
     total_w -= spacing
     tx = canvas_w - hashtag_right - total_w
     ty = canvas_h - hashtag_bottom - hashtag_size
+    items = []
     cx = tx
     for glyph, cw in zip(hashtag, char_widths):
-        draw.text((cx, ty), glyph, font=font, fill=fill)
+        items.append(((cx, ty), glyph))
         cx += cw + spacing
-    return overlay.convert("RGB")
+    text_on_layer(layer, items, font, (hcr, hcg, hcb))
 
 
 # ============ Коллаборация — рендер ============
@@ -1205,41 +1255,35 @@ def collab_color(canvas: Image.Image, layout: dict, force=None) -> tuple:
 def collab_draw(overlay: Image.Image, L: dict, color: tuple, alpha: float) -> None:
     wm_rs = get_wordmark().resize((L["wm_w"], L["wm_h"]), Image.LANCZOS)
     overlay.alpha_composite(_tint_white_logo(wm_rs, color, alpha), (L["left"], L["wm_top"]))
-    fill = (int(color[0]), int(color[1]), int(color[2]), int(255 * alpha))
-    ImageDraw.Draw(overlay).text(L["x_pos"], COLLAB_X_GLYPH, font=L["font"], fill=fill)
+    text_on_layer(overlay, [(L["x_pos"], COLLAB_X_GLYPH)], L["font"], color)
     p_rs = L["p_img"].resize((L["p_w"], L["p_h"]), Image.LANCZOS)
     overlay.alpha_composite(_tint_white_logo(p_rs, color, alpha), (L["p_left"], L["p_top"]))
 
 
-def process_collab(img: Image.Image, format_key: str, partner: dict,
-                   hashtag=None, color_mode=None) -> Image.Image:
-    """КОЛЛАБОРАЦИЯ (брендинг) — внизу по центру «ÖMANKÖ × партнёр», справа
-    опционально хештег. Низ строки — как у логотипа в брендинге (COLLAB_BOTTOM).
-    partner — пресет: {"img": белый силуэт, "scale": 1.0, "dy": 0}.
+def collab_layer(bg: Image.Image, partner: dict, hashtag=None, color_mode=None) -> Image.Image:
+    """КОЛЛАБОРАЦИЯ (брендинг) — слой: внизу по центру «ÖMANKÖ × партнёр»,
+    справа опционально хештег. Низ строки — как у логотипа в брендинге
+    (COLLAB_BOTTOM). partner — пресет: {"img": белый силуэт, "scale": 1.0, "dy": 0}.
     color_mode: None/'auto' — адаптивно, 'light'/'dark' — ручное направление."""
-    fmt = FORMATS[format_key]
-    if fmt is None:
-        if img.width < 1920:
-            up = 1920 / img.width
-            canvas_w = 1920
-            canvas_h = int(img.height * up)
-        else:
-            canvas_w, canvas_h = img.size
-    else:
-        canvas_w, canvas_h = fmt
-
+    canvas_w, canvas_h = bg.size
     scale = canvas_w / 1920
     force = color_mode if color_mode in ("light", "dark") else None
-    canvas = fit_image_to_canvas(img, canvas_w, canvas_h)
     L = collab_layout(partner, scale, canvas_w,
                       anchor_bottom=canvas_h - int(COLLAB_BOTTOM * scale),
                       max_w=canvas_w * (1 - 2 * TITLE_SIDE_MARGIN))
-    color = collab_color(canvas, L, force) if COLLAB_ADAPTIVE else (255, 255, 255)
-    overlay = canvas.convert("RGBA")
-    collab_draw(overlay, L, color, ALPHA)
-    canvas = overlay.convert("RGB")
+    color = collab_color(bg, L, force) if COLLAB_ADAPTIVE else (255, 255, 255)
+    layer = new_layer(bg.size)
+    collab_draw(layer, L, color, ALPHA)
     # Хештег справа — как в брендинге, но не заходит на связку
-    return draw_corner_hashtag(canvas, hashtag, scale, L["right"] + int(60 * scale), force)
+    corner_hashtag_on_layer(layer, bg, hashtag, scale, L["right"] + int(60 * scale), force)
+    return layer
+
+
+def process_collab(img: Image.Image, format_key: str, partner: dict,
+                   hashtag=None, color_mode=None) -> Image.Image:
+    """Коллаб-брендинг фото: фон по формату + слой связки."""
+    bg = fit_image_to_canvas(img, *branding_canvas_size(format_key, img.width, img.height))
+    return apply_layer(bg, collab_layer(bg, partner, hashtag, color_mode))
 
 
 # ============ Коллаборация — логотип партнёра ============
@@ -1939,6 +1983,213 @@ def process_store(img: Image.Image, text: str, color=None) -> Image.Image:
     return canvas_rgba.convert("RGB")
 
 
+# ============ Видео: маркировка по тем же правилам, что фото ============
+# Брендинг и коллаб-брендинг умеют видео. Слой маркировки рисуют те же
+# функции, что и для фото (type1_layer / collab_layer), а ffmpeg кладёт его
+# поверх каждого кадра. Адаптивный цвет берётся со «среднего кадра» ролика:
+# усредняем несколько кадров по всей длине — цвет один на весь ролик, без
+# мигания, и это ровно правило фото («средний цвет под логотипом»), только
+# усреднённый ещё и по времени.
+FFMPEG = shutil.which("ffmpeg")
+FFPROBE = shutil.which("ffprobe")
+VIDEO_OK = bool(FFMPEG and FFPROBE)
+# Ширина готового видео. Геометрия считается от опорных 1920px, как у фото,
+# поэтому пропорции те же; 1080 — родная ширина Instagram (больше он всё
+# равно ужмёт), и кодируется в разы быстрее. Можно поменять в Railway.
+VIDEO_W = int(os.environ.get("VIDEO_WIDTH", "1080") or 1080) // 2 * 2
+VIDEO_PRESET = os.environ.get("VIDEO_PRESET", "fast")
+VIDEO_CRF = 18                    # визуально без потерь
+VIDEO_AUDIO_KBPS = 192
+VIDEO_MAX_SEC = 5 * 60            # длиннее — не берём (и в 50 МБ не влезет)
+VIDEO_TIMEOUT_SEC = 20 * 60       # потолок на один ffmpeg
+VIDEO_SAMPLES = 9                 # кадров для «среднего кадра»
+TG_UPLOAD_LIMIT = 50 * 1024 * 1024        # больше бот отправить не может
+VIDEO_SIZE_BUDGET = 46 * 1024 * 1024      # целимся с запасом под 50 МБ
+_VIDEO_SEM = asyncio.Semaphore(1)         # видео тяжёлое — по одному на сервер
+_HDR_TRC = ("smpte2084", "arib-std-b67")  # PQ / HLG — HDR с iPhone и др.
+# HDR → SDR (как ICC-профиль P3 → sRGB у фото): без этого HDR-ролик с iPhone
+# после перекодирования выглядел бы выцветшим.
+_TONEMAP = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+            "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+
+
+class VideoError(Exception):
+    """Ошибка видео с текстом, который можно показать человеку."""
+
+
+def _ff(cmd, timeout=VIDEO_TIMEOUT_SEC):
+    return subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+
+def probe_video(path: str) -> dict:
+    """Размер кадра как его видно (с учётом поворота и неквадратных
+    пикселей), длительность, HDR, есть ли звук."""
+    r = _ff([FFPROBE, "-v", "error", "-print_format", "json",
+             "-show_streams", "-show_format", path], timeout=60)
+    if r.returncode != 0:
+        raise VideoError("не смог прочитать видео — файл битый или формат незнакомый")
+    info = json.loads(r.stdout or b"{}")
+    streams = info.get("streams", [])
+    v = next((s for s in streams if s.get("codec_type") == "video"
+              and not (s.get("disposition") or {}).get("attached_pic")), None)
+    if not v or not v.get("width"):
+        raise VideoError("в файле нет видеодорожки")
+    w, h = int(v["width"]), int(v["height"])
+    try:
+        n, d = (v.get("sample_aspect_ratio") or "1:1").split(":")
+        sar = int(n) / int(d) if int(n) and int(d) else 1.0
+    except Exception:
+        sar = 1.0
+    w = int(round(w * sar))
+    rot = 0
+    for sd in v.get("side_data_list") or []:
+        if "rotation" in sd:
+            rot = int(float(sd["rotation"]))
+    if not rot:
+        rot = int(float((v.get("tags") or {}).get("rotate", 0) or 0))
+    if abs(rot) % 180 == 90:
+        w, h = h, w
+    try:
+        dur = float((info.get("format") or {}).get("duration") or v.get("duration") or 0)
+    except Exception:
+        dur = 0.0
+    return dict(w=w, h=h, dur=dur, sar=sar,
+                hdr=v.get("color_transfer") in _HDR_TRC,
+                audio=any(s.get("codec_type") == "audio" for s in streams))
+
+
+def video_canvas_size(format_key: str, w: int, h: int):
+    """Холст видео: те же форматы, что у фото, ширина VIDEO_W (чётные стороны)."""
+    fmt = FORMATS.get(format_key)
+    fw, fh = fmt if fmt else (w, h)
+    return VIDEO_W, max(2, int(round(VIDEO_W * fh / fw / 2)) * 2)
+
+
+def _video_pre(meta: dict, tonemap: bool = True) -> str:
+    """Начало цепочки фильтров: HDR → SDR и квадратные пиксели. Поворот с
+    телефона ffmpeg применяет сам (autorotate)."""
+    pre = ""
+    if meta["hdr"] and tonemap:
+        pre += _TONEMAP + ","
+    if abs(meta["sar"] - 1.0) > 0.01:
+        pre += "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
+    return pre
+
+
+def _video_fit(cw: int, ch: int) -> str:
+    """Cover-fit по центру — как fit_image_to_canvas у фото. Цвет приводим
+    к BT.709 (стандарт HD), чтобы цвета маркировки и кадра не разъехались."""
+    return (f"scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos"
+            f":out_color_matrix=bt709:out_range=tv,crop={cw}:{ch},setsar=1")
+
+
+def _grab_png(path: str, t: float, vf: str):
+    r = _ff([FFMPEG, "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", path,
+             "-frames:v", "1", "-an", "-vf", vf, "-f", "image2pipe", "-c:v", "png",
+             "pipe:1"], timeout=120)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    try:
+        return Image.open(io.BytesIO(r.stdout)).convert("RGB")
+    except Exception:
+        return None
+
+
+def _sample_times(dur: float, n: int):
+    if dur <= 0.2:
+        return [0.0]
+    return [min(dur - 0.1, dur * (i + 0.5) / n) for i in range(n)]
+
+
+def video_mean_frame(path: str, meta: dict, cw: int, ch: int, pre: str) -> Image.Image:
+    """«Средний кадр»: несколько кадров по всей длине, уже вписанных в холст,
+    усреднённые попиксельно. По нему меряем адаптивный цвет маркировки."""
+    vf = pre + _video_fit(cw, ch)
+    acc, n = None, 0
+    times = _sample_times(meta["dur"], VIDEO_SAMPLES)
+    for t in times + ([0.0] if 0.0 not in times else []):
+        if n and t == 0.0:
+            break  # кадр с самого начала — только запасной вариант
+        im = _grab_png(path, t, vf)
+        if im is None or im.size != (cw, ch):
+            continue
+        a = np.asarray(im, dtype=np.float64)
+        acc = a if acc is None else acc + a
+        n += 1
+    if not n:
+        raise VideoError("не смог достать кадры из видео")
+    return Image.fromarray(np.clip(acc / n + 0.5, 0, 255).astype(np.uint8), "RGB")
+
+
+def video_still_png(path: str) -> bytes:
+    """Кадр из середины ролика в исходном размере — для превью цвета коллаба."""
+    meta = probe_video(path)
+    im = None
+    for tonemap in (True, False):
+        im = _grab_png(path, meta["dur"] / 2, _video_pre(meta, tonemap) + "null")
+        if im is not None:
+            break
+    if im is None:
+        raise VideoError("не смог достать кадр из видео")
+    return png_bytes(im)
+
+
+def _encode_video(src: str, out: str, meta: dict, cw: int, ch: int,
+                  layer_png: str, pre: str) -> subprocess.CompletedProcess:
+    fc = (f"[0:v]{pre}{_video_fit(cw, ch)},format=yuv444p[bg];"
+          f"[1:v]format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuva444p[ov];"
+          f"[bg][ov]overlay=0:0:format=yuv444,format=yuv420p[v]")
+    cmd = [FFMPEG, "-v", "error", "-y", "-i", src, "-i", layer_png,
+           "-filter_complex", fc, "-map", "[v]", "-map", "0:a?",
+           "-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(VIDEO_CRF),
+           "-profile:v", "high", "-pix_fmt", "yuv420p"]
+    if meta["dur"] > 0:
+        # потолок битрейта, чтобы файл точно пролез в 50 МБ Telegram
+        kbps = VIDEO_SIZE_BUDGET * 8 / 1000 / meta["dur"] - VIDEO_AUDIO_KBPS - 64
+        kbps = max(600, int(kbps))
+        cmd += ["-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k"]
+    cmd += ["-colorspace", "bt709", "-color_primaries", "bt709",
+            "-color_trc", "bt709", "-color_range", "tv",
+            "-metadata:s:v:0", "rotate=0",
+            "-c:a", "aac", "-b:a", f"{VIDEO_AUDIO_KBPS}k",
+            "-movflags", "+faststart", out]
+    return _ff(cmd)
+
+
+def render_video(src: str, out: str, format_key: str, make_layer) -> dict:
+    """Маркировка одного ролика. make_layer(bg) -> RGBA-слой (type1_layer /
+    collab_layer). Синхронная и долгая — звать через asyncio.to_thread."""
+    meta = probe_video(src)
+    if meta["dur"] > VIDEO_MAX_SEC:
+        raise VideoError(f"ролик длиннее {VIDEO_MAX_SEC // 60} мин — такие не беру")
+    cw, ch = video_canvas_size(format_key, meta["w"], meta["h"])
+    attempts = [True, False] if meta["hdr"] else [True]
+    r = None
+    for tonemap in attempts:
+        pre = _video_pre(meta, tonemap)
+        try:
+            bg = video_mean_frame(src, meta, cw, ch, pre)
+        except VideoError:
+            if tonemap and meta["hdr"]:
+                continue  # нет zscale в ffmpeg — пробуем без перевода HDR
+            raise
+        layer_png = out + ".layer.png"
+        make_layer(bg).save(layer_png)
+        r = _encode_video(src, out, meta, cw, ch, layer_png, pre)
+        if r.returncode == 0:
+            break
+        logger.warning("ffmpeg (tonemap=%s): %s", tonemap,
+                       r.stderr.decode("utf-8", "ignore")[-800:])
+    if r is None or r.returncode != 0 or not os.path.exists(out):
+        raise VideoError("ffmpeg не смог собрать видео")
+    size = os.path.getsize(out)
+    if size > TG_UPLOAD_LIMIT:
+        raise VideoError(f"готовый файл {size / 1024 / 1024:.0f} МБ — больше 50 МБ, "
+                         "Telegram не даст отправить. Укороти ролик")
+    return dict(size=size, canvas=(cw, ch),
+                upscale=max(cw / meta["w"], ch / meta["h"]), hdr=meta["hdr"])
+
+
 # ============ Сессия, повтор, доставка ============
 CONV_TIMEOUT_SEC = 30 * 60       # брошенная сессия закрывается через 30 мин тишины
 UPLOAD_DEBOUNCE_SEC = 1.5        # пауза после последнего фото перед статусом «Загружено: N»
@@ -2118,6 +2369,76 @@ async def deliver(message, photos, render_one) -> int:
     return ok
 
 
+async def _fetch_video(bot, v: dict, folder: str) -> str:
+    """Скачивает ролик во временную папку; путь к файлу."""
+    ext = os.path.splitext(v.get("name") or "")[1].lower() or ".mp4"
+    path = os.path.join(folder, "src" + ext)
+    f = await bot.get_file(v["file_id"])
+    await f.download_to_drive(path)
+    return path
+
+
+async def deliver_videos(message, videos, fmt: str, make_layer, prefix: str) -> int:
+    """Маркировка и отправка роликов по одному (файлом — без пережатия
+    Telegram). make_layer(bg) — та же функция слоя, что у фото.
+    Возвращает число успешно сделанных видео."""
+    if not videos:
+        return 0
+    ok, small = 0, []
+    n = len(videos)
+    for i, v in enumerate(videos):
+        status = None
+        try:
+            status = await message.reply_text(
+                f"🎬 Видео {i+1}/{n}: рендерю… это дольше фото, примерно минута на минуту ролика.")
+        except Exception:
+            pass
+        try:
+            with tempfile.TemporaryDirectory(prefix="omk_vid_") as td:
+                src = await _fetch_video(message.get_bot(), v, td)
+                name = f"{prefix}_video_{i+1}.mp4"
+                out = os.path.join(td, name)
+                async with _VIDEO_SEM:
+                    res = await asyncio.to_thread(render_video, src, out, fmt, make_layer)
+                try:
+                    await message.chat.send_action("upload_document")
+                except Exception:
+                    pass
+                with open(out, "rb") as fh:
+                    await message.reply_document(document=fh, filename=name,
+                                                 write_timeout=600, read_timeout=600)
+            ok += 1
+            if res["upscale"] >= UPSCALE_WARN:
+                small.append((i + 1, res["upscale"]))
+        except VideoError as e:
+            await message.reply_text(f"❌ Видео {i+1}: {e}")
+        except BadRequest as e:
+            logger.exception(f"Видео {i+1}")
+            if "too big" in str(e).lower():
+                await message.reply_text(f"❌ Видео {i+1}: больше 20 МБ — Telegram не отдал его боту.")
+            else:
+                await message.reply_text(f"❌ Видео {i+1}: {human_error(e)}")
+        except subprocess.TimeoutExpired:
+            await message.reply_text(f"❌ Видео {i+1}: рендер шёл дольше "
+                                     f"{VIDEO_TIMEOUT_SEC // 60} мин — остановил. Укороти ролик.")
+        except Exception as e:
+            logger.exception(f"Ошибка видео {i+1}")
+            await message.reply_text(f"❌ Видео {i+1}: {human_error(e)}")
+        finally:
+            if status:
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+    if small:
+        nums = ", ".join(str(k) for k, _ in small)
+        worst = max(f for _, f in small)
+        await message.reply_text(
+            f"⚠️ Видео {nums} — исходник меньше холста, растянул до ×{worst:.1f}, "
+            "может быть мыльно. Пришли оригинал покрупнее, если есть.")
+    return ok
+
+
 # ---- Статус загрузки фото (одно сообщение на пачку, а не на каждое фото) ----
 def upload_keyboard(n: int):
     return InlineKeyboardMarkup([
@@ -2139,9 +2460,24 @@ def cancel_upload_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> No
         job.schedule_removal()
 
 
+def media_count(ud) -> int:
+    return len(ud.get("photos") or []) + len(ud.get("videos") or [])
+
+
+def media_label(ud, bold: bool = False) -> str:
+    """«3 фото», «2 видео», «3 фото · 1 видео»."""
+    b = "*" if bold else ""
+    parts = []
+    if ud.get("photos"):
+        parts.append(f"{b}{len(ud['photos'])}{b} фото")
+    if ud.get("videos"):
+        parts.append(f"{b}{len(ud['videos'])}{b} видео")
+    return " · ".join(parts) or "0 фото"
+
+
 async def _post_upload_status(bot, chat_id: int, ud) -> None:
-    photos = ud.get("photos") or []
-    if not photos:
+    n = media_count(ud)
+    if not n:
         return
     old = ud.pop("upl_status", None)
     if old:
@@ -2149,11 +2485,23 @@ async def _post_upload_status(bot, chat_id: int, ud) -> None:
             await bot.delete_message(chat_id, old)
         except Exception:
             pass
-    n = len(photos)
     msg = await bot.send_message(
-        chat_id, f"📥 Загружено: *{n}* фото.\nДокидывай ещё или жми «Готово».",
+        chat_id, f"📥 Загружено: {media_label(ud, bold=True)}.\nДокидывай ещё или жми «Готово».",
         parse_mode="Markdown", reply_markup=upload_keyboard(n))
     ud["upl_status"] = msg.message_id
+
+
+async def schedule_upload_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Не отвечаем на каждый файл: ждём паузу после последнего и шлём ОДИН
+    статус «Загружено: N» с кнопками. Альбом из 10 фото = 1 сообщение."""
+    chat_id = update.effective_chat.id
+    cancel_upload_status(context, chat_id)
+    if context.job_queue:
+        context.job_queue.run_once(
+            _upload_status_job, UPLOAD_DEBOUNCE_SEC, chat_id=chat_id,
+            user_id=update.effective_user.id, name=_upload_job_name(chat_id))
+    else:
+        await _post_upload_status(context.bot, chat_id, context.user_data)
 
 
 async def _upload_status_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2253,9 +2601,13 @@ def photos_prompt_text(context) -> str:
     """Текст шага «пришли фото» — общий для прямого хода, повтора и «Назад»."""
     ud = context.user_data
     mode = ud.get("mode")
-    n = len(ud.get("photos", []))
+    n = media_count(ud)
     have = f"📂 Уже загружено: *{n}*. " if n else ""
-    tail = f"{have}Пришли фото, затем «Готово» или /done"
+    if video_allowed(ud):
+        tail = (f"🎬 Видео тоже можно — до 20 МБ, маркировка по тем же правилам.\n\n"
+                f"{have}Пришли фото или видео, затем «Готово» или /done")
+    else:
+        tail = f"{have}Пришли фото, затем «Готово» или /done"
     if ud.get("repeat"):
         head = ("🔁 *Повтор:* " + escape_markdown(settings_summary(ud), version=1)
                 + "\n\nВсё как в прошлый раз — нужны только новые фото.")
@@ -2326,17 +2678,47 @@ async def receive_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_PHOTOS
     photos = context.user_data.setdefault("photos", [])
     photos.append(data)
+    await schedule_upload_status(update, context)
+    return WAITING_PHOTOS
 
-    # Не отвечаем на каждое фото: ждём паузу после последнего и шлём ОДИН
-    # статус «Загружено: N» с кнопками. Альбом из 10 фото = 1 сообщение.
-    chat_id = update.effective_chat.id
-    cancel_upload_status(context, chat_id)
-    if context.job_queue:
-        context.job_queue.run_once(
-            _upload_status_job, UPLOAD_DEBOUNCE_SEC, chat_id=chat_id,
-            user_id=update.effective_user.id, name=_upload_job_name(chat_id))
-    else:
-        await _post_upload_status(context.bot, chat_id, context.user_data)
+
+def video_allowed(ud) -> bool:
+    """Видео маркируем в брендинге и коллаб-брендинге (обложки и STORE — фото)."""
+    return ud.get("mode") == "type1" or (is_collab(ud) and not is_cover(ud))
+
+
+def too_big_video_text(v) -> str:
+    size = f" ({v.file_size / 1024 / 1024:.0f} МБ)" if v and v.file_size else ""
+    return (f"⚠️ Видео{size} больше 20 МБ — Telegram не даёт ботам скачивать такие.\n"
+            "Варианты: пришли его *обычным видео* (не файлом) — Telegram сам ужмёт; "
+            "или экспортируй полегче (1080p, покороче).")
+
+
+async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Видео на шаге загрузки: запоминаем file_id (качаем уже при рендере —
+    не держим ролики в памяти), проверяем лимит 20 МБ сразу."""
+    msg = update.message
+    ud = context.user_data
+    v = msg.video or msg.document
+    if not video_allowed(ud):
+        await msg.reply_text("🎬 Видео умею в 🏷 Брендинге и 🤝 коллаб-брендинге. "
+                             "Здесь — только фото.")
+        return WAITING_PHOTOS
+    if not VIDEO_OK:
+        await msg.reply_text("🎬 Видео сейчас не получится — на сервере нет ffmpeg. "
+                             "Пусть админ обновит Dockerfile.")
+        return WAITING_PHOTOS
+    if v is None:
+        return WAITING_PHOTOS
+    if v.file_size and v.file_size > TG_DOWNLOAD_LIMIT:
+        await msg.reply_text(too_big_video_text(v), parse_mode="Markdown")
+        return WAITING_PHOTOS
+    ud.setdefault("videos", []).append({
+        "file_id": v.file_id,
+        "name": getattr(v, "file_name", None),
+        "size": v.file_size or 0,
+    })
+    await schedule_upload_status(update, context)
     return WAITING_PHOTOS
 
 
@@ -2346,10 +2728,12 @@ async def photos_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Сбросил")
     cancel_upload_status(context, update.effective_chat.id)
     context.user_data["photos"] = []
+    context.user_data["videos"] = []
+    context.user_data.pop("_vstill", None)
     context.user_data.pop("upl_status", None)
     try:
         await query.edit_message_text(
-            "🗑 Все фото сброшены — присылай заново.", reply_markup=back_keyboard())
+            "🗑 Всё сброшено — присылай заново.", reply_markup=back_keyboard())
     except Exception:
         pass
     return WAITING_PHOTOS
@@ -2376,7 +2760,7 @@ async def _proceed_after_photos(message, context: ContextTypes.DEFAULT_TYPE):
     """Общий шаг после загрузки фото (/done или кнопка «Готово»)."""
     ud = context.user_data
     photos = ud.get("photos", [])
-    if not photos:
+    if not photos and not (video_allowed(ud) and ud.get("videos")):
         await message.reply_text("Сначала отправь хотя бы одно фото!")
         return WAITING_PHOTOS
     mode = ud.get("mode")
@@ -2390,10 +2774,10 @@ async def _proceed_after_photos(message, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_STORE_TEXT
     if ud.get("repeat"):
         await message.reply_text("⚙️ Готовлю превью..." if is_collab(ud)
-                                 else f"⚙️ Обрабатываю {len(photos)} фото...")
+                                 else f"⚙️ Обрабатываю {media_label(ud)}...")
         return await _render_with_hashtag(message, context, ud.get("hashtag", NO_HASHTAG))
     await message.reply_text(
-        f"📐 Выбери формат ({len(photos)} фото):", reply_markup=format_kb(ud)
+        f"📐 Выбери формат ({media_label(ud)}):", reply_markup=format_kb(ud)
     )
     return CHOOSING_FORMAT
 
@@ -2481,11 +2865,14 @@ async def generate_collab(message, context: ContextTypes.DEFAULT_TYPE):
         res = process_collab(img, fmt, partner, hashtag=hashtag, color_mode=color)
         return [(to_jpeg(res), f"collab_{i+1}.jpg")], upscale_factor(img, res.size)
 
+    videos = ud.get("videos") or []
     ok = await deliver(message, photos, render_one)
-    record_post("base", "collab", ok, partner=partner["name"], kind="type1")
-    if ok:
+    vok = await deliver_videos(message, videos, fmt,
+                               lambda bg: collab_layer(bg, partner, hashtag, color), "collab")
+    record_post("base", "collab", ok, partner=partner["name"], kind="type1", videos=vok)
+    if ok or vok:
         touch_partner(partner["id"], hashtag)
-    return await finish(message, context, ok, len(photos))
+    return await finish(message, context, ok + vok, len(photos) + len(videos))
 
 
 async def _after_store_text(message, context: ContextTypes.DEFAULT_TYPE):
@@ -2767,9 +3154,12 @@ async def _render_with_hashtag(message, context: ContextTypes.DEFAULT_TYPE, hash
         res = process_image(img, fmt, hashtag, channel=channel)
         return [(to_jpeg(res), f"1_{i+1}.jpg")], upscale_factor(img, res.size)
 
+    videos = ud.get("videos") or []
     ok = await deliver(message, photos, render_one)
-    record_post(channel, mode, ok)
-    return await finish(message, context, ok, len(photos))
+    vok = await deliver_videos(message, videos, fmt,
+                               lambda bg: type1_layer(bg, hashtag, channel), "1")
+    record_post(channel, mode, ok, videos=vok)
+    return await finish(message, context, ok + vok, len(photos) + len(videos))
 
 
 async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2788,9 +3178,8 @@ async def choose_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_CUSTOM_HASHTAG
 
     ud = context.user_data
-    photos = ud.get("photos", [])
     await query.edit_message_text("⚙️ Готовлю превью..." if (is_cover(ud) or is_collab(ud))
-                                  else f"⚙️ Обрабатываю {len(photos)} фото...")
+                                  else f"⚙️ Обрабатываю {media_label(ud)}...")
     return await _render_with_hashtag(query.message, context, tag)
 
 
@@ -2817,9 +3206,8 @@ async def receive_custom_hashtag(update: Update, context: ContextTypes.DEFAULT_T
     hashtag = "#" + token
 
     ud = context.user_data
-    photos = ud.get("photos", [])
     await update.message.reply_text("⚙️ Готовлю превью..." if (is_cover(ud) or is_collab(ud))
-                                    else f"⚙️ Обрабатываю {len(photos)} фото с {hashtag}...")
+                                    else f"⚙️ Обрабатываю {media_label(ud)} с {hashtag}...")
     return await _render_with_hashtag(update.message, context, hashtag)
 
 
@@ -3359,7 +3747,7 @@ async def partner_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- Коллаб-брендинг: цвет связки с превью ----
 def _collab_color_caption(cur: str) -> str:
-    return ("🎨 *Цвет связки* — превью на первом фото 👇\n"
+    return ("🎨 *Цвет связки* — превью на первом кадре 👇\n"
             "Авто выбирает светлый или тёмный по фону, как в брендинге.\n\n"
             f"*Сейчас:* {COLLAB_COLORS.get(cur, COLLAB_COLORS['auto'])}")
 
@@ -3371,9 +3759,24 @@ def _render_collab_preview(photo_bytes, fmt, partner, hashtag, color) -> bytes:
     return to_jpeg(res, quality=85)
 
 
+async def preview_source(context) -> bytes:
+    """Картинка для превью: первое фото, а если пришли только видео — кадр
+    из середины первого ролика (достаём один раз и кешируем)."""
+    ud = context.user_data
+    if ud.get("photos"):
+        return ud["photos"][0]
+    if not ud.get("_vstill"):
+        with tempfile.TemporaryDirectory(prefix="omk_still_") as td:
+            src = await _fetch_video(context.bot, ud["videos"][0], td)
+            async with _VIDEO_SEM:
+                ud["_vstill"] = await asyncio.to_thread(video_still_png, src)
+    return ud["_vstill"]
+
+
 async def _collab_preview(context) -> bytes:
     ud = context.user_data
-    return await run_render(_render_collab_preview, ud["photos"][0], ud.get("format", "4:5"),
+    return await run_render(_render_collab_preview, await preview_source(context),
+                            ud.get("format", "4:5"),
                             partner_for_render(ud.get("partner_id")),
                             ud.get("hashtag", NO_HASHTAG), ud.get("collab_color", "auto"))
 
@@ -3382,7 +3785,7 @@ async def collab_color_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     ud = context.user_data
     action = query.data.split(":", 1)[1]
-    if not ud.get("photos") or not partner_for_render(ud.get("partner_id")):
+    if not media_count(ud) or not partner_for_render(ud.get("partner_id")):
         await query.answer("Сессия устарела — начни заново: /start", show_alert=True)
         return COLLAB_COLOR
     if action == "go":
@@ -3391,7 +3794,7 @@ async def collab_color_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await query.message.reply_text(f"⚙️ Обрабатываю {len(ud['photos'])} фото...")
+        await query.message.reply_text(f"⚙️ Обрабатываю {media_label(ud)}...")
         return await generate_collab(query.message, context)
     if action not in COLLAB_COLORS:
         await query.answer()
@@ -3493,8 +3896,10 @@ async def photos_wrong_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """На шаге фото пришло не фото — подсказываем, а не молчим."""
     m = update.message
     mime = (m.document.mime_type or "") if m.document else ""
-    if m.video or m.animation or mime.startswith("video/"):
-        text = "🎬 Видео пока не умею — только картинки."
+    if m.animation:
+        text = "🎬 GIF-анимации не умею — пришли ролик как видео."
+    elif m.video or mime.startswith("video/"):
+        text = "🎬 Видео умею в 🏷 Брендинге и 🤝 коллаб-брендинге. Здесь — только фото."
     elif m.document:
         text = "📄 Это не картинка. Пришли JPG, PNG, HEIC или WebP."
     else:
@@ -3510,10 +3915,12 @@ async def orphan_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if m.media_group_id and context.chat_data.get("orphan_mg") == m.media_group_id:
         return
     context.chat_data["orphan_mg"] = m.media_group_id
+    what = "видео" if (m.video or (m.document and (m.document.mime_type or "").startswith("video/"))) else "фото"
     if context.user_data.get("mode"):
-        text = "Сейчас я жду не фото 🙂 Посмотри последнее сообщение — или /start, чтобы начать заново."
+        text = f"Сейчас я жду не {what} 🙂 Посмотри последнее сообщение — или /start, чтобы начать заново."
     else:
-        text = "📸 Вижу фото! Чтобы сделать пост, нажми /start — фото пришлёшь на следующем шаге."
+        text = (f"{'🎬' if what == 'видео' else '📸'} Вижу {what}! Чтобы сделать пост, нажми /start — "
+                f"{what} пришлёшь на следующем шаге.")
     await m.reply_text(text)
 
 
@@ -3596,9 +4003,9 @@ async def back_from_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back_to_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    photos = context.user_data.get("photos", [])
     await query.edit_message_text(
-        f"📐 Выбери формат ({len(photos)} фото):", reply_markup=format_kb(context.user_data))
+        f"📐 Выбери формат ({media_label(context.user_data)}):",
+        reply_markup=format_kb(context.user_data))
     return CHOOSING_FORMAT
 
 
@@ -3903,6 +4310,7 @@ def main():
             ],
             WAITING_PHOTOS: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photos),
+                MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video),
                 CommandHandler("done", done),
                 CallbackQueryHandler(photos_done, pattern="^photos:done$"),
                 CallbackQueryHandler(photos_reset, pattern="^photos:reset$"),
@@ -3968,7 +4376,8 @@ def main():
     app.add_handler(conv)
     # Фото вне диалога (без /start или не на том шаге) — короткая подсказка
     app.add_handler(MessageHandler(
-        filters.UpdateType.MESSAGE & (filters.PHOTO | filters.Document.IMAGE), orphan_media))
+        filters.UpdateType.MESSAGE & (filters.PHOTO | filters.Document.IMAGE
+                                      | filters.VIDEO | filters.Document.VIDEO), orphan_media))
     # Последним: кнопки из закрытых/старых диалогов — просто гасим «часики»
     app.add_handler(CallbackQueryHandler(stale_callback))
     app.add_error_handler(on_error)
@@ -3981,6 +4390,7 @@ def main():
     logger.info("Текст: " + ("RAQM — кернинг включён" if features.check("raqm")
                              else "BASIC — без кернинга (нет libfribidi0 в Dockerfile)"))
     logger.info(f"SVG-логотипы: {'включены' if SVG_OK else 'выключены (нет cairosvg/libcairo2)'}")
+    logger.info(f"Видео: {'включено (ffmpeg ' + FFMPEG + f', ширина {VIDEO_W}px)' if VIDEO_OK else 'выключено — нет ffmpeg в Dockerfile'}")
     n_partners = len(load_partners())
     logger.info(f"Партнёров в пресетах: {n_partners}")
     if app.job_queue:
