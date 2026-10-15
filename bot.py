@@ -1134,10 +1134,15 @@ def type1_layer(bg: Image.Image, hashtag: str, channel: str = "base") -> Image.I
         logo_y = canvas_h - int(LOGO_BOTTOM * scale) - logo_h
 
     layer = new_layer(bg.size)
-    # ЛОГОТИП — адаптивный цвет по фону под ним
+    tag_left_limit = logo_x + logo_w + int(60 * scale)  # хештег не левее лого (+60px)
+    # ЦВЕТ — один на лого и хештег: фон под лого и под хештегом усредняем,
+    # по общей яркости решаем «светлее/темнее». Так лого и хештег всегда
+    # либо оба светлые, либо оба тёмные. Без хештега — только фон под лого.
     r, g, b = get_average_color(bg, logo_x, logo_y, logo_w, logo_h)
-    percent = BRIGHTNESS_OFFSET if brightness_of(r, g, b) < 128 else -BRIGHTNESS_OFFSET
-    logo_color = adjust_brightness(r, g, b, percent)
+    tag_bg = corner_hashtag_bg(bg, hashtag, scale, tag_left_limit)
+    if tag_bg:
+        r, g, b = (r + tag_bg[0]) / 2, (g + tag_bg[1]) / 2, (b + tag_bg[2]) / 2
+    logo_color = adjust_brightness(r, g, b, adaptive_percent(r, g, b))
     placed = False
     if ch["type1_logo"]:
         placed = paste_type1_channel_logo(layer, ch["type1_logo"],
@@ -1145,8 +1150,8 @@ def type1_layer(bg: Image.Image, hashtag: str, channel: str = "base") -> Image.I
     if not placed:
         draw_logo(layer, logo_x, logo_y, logo_w, logo_h, logo_color)
 
-    # ХЕШТЕГ: не заходит левее лого (+60px воздуха)
-    corner_hashtag_on_layer(layer, bg, hashtag, scale, logo_x + logo_w + int(60 * scale))
+    # ХЕШТЕГ — тем же цветом, что и лого; не заходит левее лого (+60px воздуха)
+    corner_hashtag_on_layer(layer, bg, hashtag, scale, tag_left_limit, color=logo_color)
     return layer
 
 
@@ -1156,15 +1161,12 @@ def process_image(img: Image.Image, format_key: str, hashtag: str, channel: str 
     return apply_layer(bg, type1_layer(bg, hashtag, channel))
 
 
-def corner_hashtag_on_layer(layer: Image.Image, bg: Image.Image, hashtag: str,
-                            scale: float, left_limit: int, force=None) -> None:
-    """Хештег в правом нижнем углу (брендинг и коллаб). Длинный хештег не
-    заходит левее left_limit — кегль уменьшается. Цвет замеряется по фону с уже
-    положенной графикой (как раньше). force — ручное направление цвета
-    ('light'/'dark'), None — адаптивно, как всегда."""
+def _corner_hashtag_geom(canvas_size, hashtag: str, scale: float, left_limit: int):
+    """Геометрия хештега в правом нижнем углу: кегль (с автоподгонкой, чтобы
+    не заходить левее left_limit) и зона замера фона. None — хештега нет."""
     if not hashtag or hashtag == NO_HASHTAG:
-        return
-    canvas_w, canvas_h = layer.size
+        return None
+    canvas_w, canvas_h = canvas_size
     hashtag_right = int(HASHTAG_RIGHT * scale)
     hashtag_bottom = int(HASHTAG_BOTTOM * scale)
     hashtag_size = int(HASHTAG_SIZE * scale)
@@ -1174,11 +1176,41 @@ def corner_hashtag_on_layer(layer: Image.Image, bg: Image.Image, hashtag: str,
     sample_x = max(0, canvas_w - hashtag_right - int(200 * scale))
     sample_y = max(0, canvas_h - hashtag_bottom - hashtag_size)
     sample_w, sample_h = int(200 * scale), hashtag_size + 20
-    view = Image.alpha_composite(
-        bg.crop((sample_x, sample_y, sample_x + sample_w, sample_y + sample_h)).convert("RGBA"),
-        layer.crop((sample_x, sample_y, sample_x + sample_w, sample_y + sample_h)))
-    hr, hg, hb = get_average_color(view, 0, 0, sample_w, sample_h)
-    hcr, hcg, hcb = adjust_brightness(hr, hg, hb, adaptive_percent(hr, hg, hb, force))
+    return dict(right=hashtag_right, bottom=hashtag_bottom, size=hashtag_size,
+                sample=(sample_x, sample_y, sample_w, sample_h))
+
+
+def corner_hashtag_bg(bg: Image.Image, hashtag: str, scale: float, left_limit: int):
+    """Средний цвет фона под будущим хештегом — чтобы выбрать ОДИН цвет на
+    лого и хештег. None — хештега нет."""
+    geom = _corner_hashtag_geom(bg.size, hashtag, scale, left_limit)
+    if not geom:
+        return None
+    return get_average_color(bg, *geom["sample"])
+
+
+def corner_hashtag_on_layer(layer: Image.Image, bg: Image.Image, hashtag: str,
+                            scale: float, left_limit: int, force=None,
+                            color=None) -> None:
+    """Хештег в правом нижнем углу (брендинг и коллаб). Длинный хештег не
+    заходит левее left_limit — кегль уменьшается. color — готовый цвет (общий
+    с лого/связкой); если не задан — замер по фону с уже положенной графикой,
+    force — ручное направление ('light'/'dark'), None — адаптивно."""
+    geom = _corner_hashtag_geom(layer.size, hashtag, scale, left_limit)
+    if not geom:
+        return
+    canvas_w, canvas_h = layer.size
+    hashtag_right, hashtag_bottom = geom["right"], geom["bottom"]
+    hashtag_size = geom["size"]
+    if color is not None:
+        hcr, hcg, hcb = (int(color[0]), int(color[1]), int(color[2]))
+    else:
+        sample_x, sample_y, sample_w, sample_h = geom["sample"]
+        view = Image.alpha_composite(
+            bg.crop((sample_x, sample_y, sample_x + sample_w, sample_y + sample_h)).convert("RGBA"),
+            layer.crop((sample_x, sample_y, sample_x + sample_w, sample_y + sample_h)))
+        hr, hg, hb = get_average_color(view, 0, 0, sample_w, sample_h)
+        hcr, hcg, hcb = adjust_brightness(hr, hg, hb, adaptive_percent(hr, hg, hb, force))
 
     font = load_semibold(hashtag_size)
     spacing = int(hashtag_size * (-0.007))
@@ -1271,11 +1303,21 @@ def collab_layer(bg: Image.Image, partner: dict, hashtag=None, color_mode=None) 
     L = collab_layout(partner, scale, canvas_w,
                       anchor_bottom=canvas_h - int(COLLAB_BOTTOM * scale),
                       max_w=canvas_w * (1 - 2 * TITLE_SIDE_MARGIN))
-    color = collab_color(bg, L, force) if COLLAB_ADAPTIVE else (255, 255, 255)
+    tag_left_limit = L["right"] + int(60 * scale)  # хештег не заходит на связку
+    if COLLAB_ADAPTIVE:
+        # Один цвет на связку и хештег (как в брендинге): фон под связкой и
+        # под хештегом усредняем → оба либо светлые, либо тёмные.
+        sr, sg, sb = get_average_color(bg, *L["strip"])
+        tag_bg = corner_hashtag_bg(bg, hashtag, scale, tag_left_limit)
+        if tag_bg:
+            sr, sg, sb = (sr + tag_bg[0]) / 2, (sg + tag_bg[1]) / 2, (sb + tag_bg[2]) / 2
+        color = adjust_brightness(sr, sg, sb, adaptive_percent(sr, sg, sb, force))
+    else:
+        color = (255, 255, 255)
     layer = new_layer(bg.size)
     collab_draw(layer, L, color, ALPHA)
-    # Хештег справа — как в брендинге, но не заходит на связку
-    corner_hashtag_on_layer(layer, bg, hashtag, scale, L["right"] + int(60 * scale), force)
+    # Хештег справа — тем же цветом, что и связка
+    corner_hashtag_on_layer(layer, bg, hashtag, scale, tag_left_limit, color=color)
     return layer
 
 
